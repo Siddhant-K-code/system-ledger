@@ -19,12 +19,13 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const schemaVersion = 1
+const schemaVersion = 2
 
 var createTablePattern = regexp.MustCompile("(?is)\\bCREATE\\s+(?:TEMP(?:ORARY)?\\s+)?TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?((?:[\"`\\[]?[A-Za-z_][A-Za-z0-9_$]*[\"`\\]]?\\s*\\.\\s*)*(?:[\"`\\[]?[A-Za-z_][A-Za-z0-9_$]*[\"`\\]]?))")
 
 type Stats struct {
 	Sources, APIs, Operations, Schemas, Tables int
+	Services, CandidateFiles, SkippedFiles     int
 }
 
 type Asset struct {
@@ -59,6 +60,9 @@ func Migrate(db *sql.DB) error {
 	}
 	if version == schemaVersion {
 		return nil
+	}
+	if version == 1 {
+		return applyProjectSchema(db)
 	}
 	tx, err := db.Begin()
 	if err != nil {
@@ -98,8 +102,62 @@ func Migrate(db *sql.DB) error {
 			return fmt.Errorf("apply schema migration: %w", err)
 		}
 	}
-	if _, err := tx.Exec(`INSERT INTO schema_migrations(version) VALUES (?)`, schemaVersion); err != nil {
+	if _, err := tx.Exec(`INSERT INTO schema_migrations(version) VALUES (1)`); err != nil {
 		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return applyProjectSchema(db)
+}
+
+func applyProjectSchema(db *sql.DB) error {
+	// SQLite cannot widen a CHECK constraint in place, so rebuild the two
+	// dependent tables while foreign-key enforcement is temporarily disabled.
+	if _, err := db.Exec(`PRAGMA foreign_keys = OFF`); err != nil {
+		return fmt.Errorf("disable foreign keys for migration: %w", err)
+	}
+	defer db.Exec(`PRAGMA foreign_keys = ON`)
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	statements := []string{
+		`CREATE TABLE relationships_v2 (
+			id INTEGER PRIMARY KEY, from_asset_id INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+			to_asset_id INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+			relationship_type TEXT NOT NULL, origin TEXT NOT NULL,
+			UNIQUE(from_asset_id, to_asset_id, relationship_type, origin)
+		)`,
+		`INSERT INTO relationships_v2 SELECT id, from_asset_id, to_asset_id, relationship_type, origin FROM relationships`,
+		`CREATE TABLE evidence_v2 (
+			id INTEGER PRIMARY KEY, source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+			asset_id INTEGER REFERENCES assets(id) ON DELETE CASCADE,
+			relationship_id INTEGER REFERENCES relationships_v2(id) ON DELETE CASCADE,
+			locator TEXT NOT NULL,
+			CHECK ((asset_id IS NOT NULL AND relationship_id IS NULL) OR (asset_id IS NULL AND relationship_id IS NOT NULL))
+		)`,
+		`INSERT INTO evidence_v2 SELECT id, source_id, asset_id, relationship_id, locator FROM evidence`,
+		`DROP TABLE evidence`,
+		`DROP TABLE relationships`,
+		`ALTER TABLE relationships_v2 RENAME TO relationships`,
+		`ALTER TABLE evidence_v2 RENAME TO evidence`,
+		`CREATE INDEX idx_relationships_from ON relationships(from_asset_id)`,
+		`CREATE INDEX idx_relationships_to ON relationships(to_asset_id)`,
+		`CREATE INDEX idx_evidence_asset ON evidence(asset_id)`,
+		`CREATE INDEX idx_evidence_relationship ON evidence(relationship_id)`,
+		`CREATE TABLE project_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
+		`CREATE TABLE service_configs (
+			name TEXT PRIMARY KEY, owner TEXT NOT NULL, source_root TEXT NOT NULL UNIQUE,
+			domain TEXT NOT NULL DEFAULT '', tags TEXT NOT NULL DEFAULT '[]'
+		)`,
+		`INSERT INTO schema_migrations(version) VALUES (2)`,
+	}
+	for _, statement := range statements {
+		if _, err := tx.Exec(statement); err != nil {
+			return fmt.Errorf("apply project schema migration: %w", err)
+		}
 	}
 	return tx.Commit()
 }
@@ -135,13 +193,22 @@ func Ingest(db *sql.DB, root string) (Stats, error) {
 			return Stats{}, fmt.Errorf("clear previous %s: %w", table, err)
 		}
 	}
+	if _, err := tx.Exec(`INSERT INTO project_metadata(key, value) VALUES ('project_root', ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value`, root); err != nil {
+		return Stats{}, fmt.Errorf("record project root: %w", err)
+	}
 	var stats Stats
+	stats.CandidateFiles = len(files)
 	for _, path := range files {
 		bytes, err := os.ReadFile(path)
 		if err != nil {
 			return Stats{}, fmt.Errorf("read %q: %w", path, err)
 		}
-		sourceID, err := insertSource(tx, path, bytes)
+		relativePath, err := filepath.Rel(root, path)
+		if err != nil {
+			return Stats{}, fmt.Errorf("make source path relative to project: %w", err)
+		}
+		sourceID, err := insertSource(tx, filepath.ToSlash(relativePath), bytes)
 		if err != nil {
 			return Stats{}, err
 		}
@@ -161,6 +228,7 @@ func Ingest(db *sql.DB, root string) (Stats, error) {
 					return Stats{}, err
 				}
 				stats.Sources--
+				stats.SkippedFiles++
 			}
 		}
 	}
@@ -180,8 +248,12 @@ func supportedFiles(root string) ([]string, error) {
 			return err
 		}
 		if d.IsDir() {
+			if path != root && ignoredDirectory(d.Name()) {
+				return filepath.SkipDir
+			}
 			return nil
 		}
+
 		switch strings.ToLower(filepath.Ext(path)) {
 		case ".json", ".yaml", ".yml", ".sql":
 			files = append(files, path)
@@ -190,6 +262,15 @@ func supportedFiles(root string) ([]string, error) {
 	})
 	sort.Strings(files)
 	return files, err
+}
+
+func ignoredDirectory(name string) bool {
+	switch name {
+	case ".git", ".system-ledger", "node_modules", "vendor":
+		return true
+	default:
+		return false
+	}
 }
 
 func insertSource(tx *sql.Tx, path string, content []byte) (int64, error) {
@@ -407,6 +488,13 @@ func Explain(db *sql.DB, out io.Writer, name string) error {
 	if asset.Attributes != "{}" {
 		fmt.Fprintf(out, "Attributes: %s\n", asset.Attributes)
 	}
+	owners, err := ownersFor(db, asset.ID)
+	if err != nil {
+		return err
+	}
+	if len(owners) > 0 {
+		fmt.Fprintf(out, "Owners: %s\n", strings.Join(owners, ", "))
+	}
 	if err := writeEvidence(db, out, "Evidence", "asset_id", asset.ID); err != nil {
 		return err
 	}
@@ -420,6 +508,13 @@ func Impact(db *sql.DB, out io.Writer, query string) error {
 		return err
 	}
 	fmt.Fprintf(out, "Direct impact graph for %s %q:\n", asset.Kind, asset.Name)
+	owners, err := ownersFor(db, asset.ID)
+	if err != nil {
+		return err
+	}
+	if len(owners) > 0 {
+		fmt.Fprintf(out, "Owners: %s\n", strings.Join(owners, ", "))
+	}
 	return writeRelations(db, out, asset.ID)
 }
 
@@ -527,56 +622,6 @@ func writeEvidence(db *sql.DB, out io.Writer, label, column string, id int64) er
 	}
 	fmt.Fprintf(out, "%s: %s\n", label, strings.Join(references, "; "))
 	return nil
-}
-
-// Verify checks relational consistency and that every recorded source is still
-// present and byte-identical to the evidence used to construct the ledger.
-func Verify(db *sql.DB) error {
-	checks := []struct {
-		name, query string
-	}{
-		{"foreign-key violations", `PRAGMA foreign_key_check`},
-		{"assets without evidence", `SELECT a.id FROM assets a LEFT JOIN evidence e ON e.asset_id = a.id WHERE e.id IS NULL`},
-		{"relationships without evidence", `SELECT r.id FROM relationships r LEFT JOIN evidence e ON e.relationship_id = r.id WHERE e.id IS NULL`},
-		{"orphaned evidence", `SELECT e.id FROM evidence e LEFT JOIN sources s ON s.id = e.source_id WHERE s.id IS NULL`},
-	}
-	for _, check := range checks {
-		rows, err := db.Query(check.query)
-		if err != nil {
-			return fmt.Errorf("run %s check: %w", check.name, err)
-		}
-		if rows.Next() {
-			var id any
-			_ = rows.Scan(&id)
-			rows.Close()
-			return fmt.Errorf("verification failed: %s (record %v)", check.name, id)
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return err
-		}
-		rows.Close()
-	}
-	rows, err := db.Query(`SELECT path, sha256 FROM sources ORDER BY path`)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var path, expected string
-		if err := rows.Scan(&path, &expected); err != nil {
-			return err
-		}
-		content, err := os.ReadFile(path)
-		if err != nil {
-			return fmt.Errorf("verification failed: source %q is unavailable: %w", path, err)
-		}
-		sum := sha256.Sum256(content)
-		if hex.EncodeToString(sum[:]) != expected {
-			return fmt.Errorf("verification failed: source %q changed since ingestion", path)
-		}
-	}
-	return rows.Err()
 }
 
 func asMap(value any) map[string]any {

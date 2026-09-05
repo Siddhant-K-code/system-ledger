@@ -1,0 +1,3 @@
+CREATE TABLE "order" (
+  id TEXT PRIMARY KEY
+);

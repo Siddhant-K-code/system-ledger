@@ -1,0 +1,12 @@
+version: 1
+services:
+  - name: catalog-service
+    owner: commerce-platform
+    source: services/catalog
+    domain: commerce
+    tags: [api, catalog]
+  - name: orders-service
+    owner: fulfillment-platform
+    source: services/orders
+    domain: fulfillment
+    tags: [api, orders]
