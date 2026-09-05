@@ -1,0 +1,650 @@
+// Package ledger owns the local SQLite model and deterministic v0 extraction rules.
+package ledger
+
+import (
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+	"unicode"
+
+	"gopkg.in/yaml.v3"
+)
+
+const schemaVersion = 1
+
+var createTablePattern = regexp.MustCompile("(?is)\\bCREATE\\s+(?:TEMP(?:ORARY)?\\s+)?TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?((?:[\"`\\[]?[A-Za-z_][A-Za-z0-9_$]*[\"`\\]]?\\s*\\.\\s*)*(?:[\"`\\[]?[A-Za-z_][A-Za-z0-9_$]*[\"`\\]]?))")
+
+type Stats struct {
+	Sources, APIs, Operations, Schemas, Tables int
+}
+
+type Asset struct {
+	ID            int64
+	Kind, Name    string
+	CanonicalName string
+	Attributes    string
+}
+
+type Relation struct {
+	ID                 int64
+	FromID, ToID       int64
+	Type, Origin       string
+	FromKind, FromName string
+	ToKind, ToName     string
+}
+
+// Migrate creates the built-in, versioned schema. It is safe to call before every command.
+func Migrate(db *sql.DB) error {
+	if _, err := db.Exec(`PRAGMA foreign_keys = ON`); err != nil {
+		return fmt.Errorf("enable foreign keys: %w", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY)`); err != nil {
+		return fmt.Errorf("create migration table: %w", err)
+	}
+	var version int
+	if err := db.QueryRow(`SELECT COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&version); err != nil {
+		return fmt.Errorf("read schema version: %w", err)
+	}
+	if version > schemaVersion {
+		return fmt.Errorf("ledger schema version %d is newer than this CLI supports", version)
+	}
+	if version == schemaVersion {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	statements := []string{
+		`CREATE TABLE sources (
+			id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE, sha256 TEXT NOT NULL
+		)`,
+		`CREATE TABLE assets (
+			id INTEGER PRIMARY KEY, source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+			kind TEXT NOT NULL, name TEXT NOT NULL, canonical_name TEXT NOT NULL, attributes TEXT NOT NULL DEFAULT '{}',
+			UNIQUE(source_id, kind, canonical_name)
+		)`,
+		`CREATE TABLE relationships (
+			id INTEGER PRIMARY KEY, from_asset_id INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+			to_asset_id INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+			relationship_type TEXT NOT NULL, origin TEXT NOT NULL CHECK(origin IN ('declared', 'inferred')),
+			UNIQUE(from_asset_id, to_asset_id, relationship_type, origin)
+		)`,
+		`CREATE TABLE evidence (
+			id INTEGER PRIMARY KEY, source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+			asset_id INTEGER REFERENCES assets(id) ON DELETE CASCADE,
+			relationship_id INTEGER REFERENCES relationships(id) ON DELETE CASCADE,
+			locator TEXT NOT NULL,
+			CHECK ((asset_id IS NOT NULL AND relationship_id IS NULL) OR (asset_id IS NULL AND relationship_id IS NOT NULL))
+		)`,
+		`CREATE INDEX idx_assets_name ON assets(name, canonical_name)`,
+		`CREATE INDEX idx_relationships_from ON relationships(from_asset_id)`,
+		`CREATE INDEX idx_relationships_to ON relationships(to_asset_id)`,
+		`CREATE INDEX idx_evidence_asset ON evidence(asset_id)`,
+		`CREATE INDEX idx_evidence_relationship ON evidence(relationship_id)`,
+	}
+	for _, statement := range statements {
+		if _, err := tx.Exec(statement); err != nil {
+			return fmt.Errorf("apply schema migration: %w", err)
+		}
+	}
+	if _, err := tx.Exec(`INSERT INTO schema_migrations(version) VALUES (?)`, schemaVersion); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// Ingest replaces prior extracted material with facts from one directory. This makes
+// reruns deterministic and idempotent while retaining the ledger's migration history.
+func Ingest(db *sql.DB, root string) (Stats, error) {
+	root, err := filepath.Abs(root)
+	if err != nil {
+		return Stats{}, fmt.Errorf("resolve input directory: %w", err)
+	}
+	info, err := os.Stat(root)
+	if err != nil {
+		return Stats{}, fmt.Errorf("read input directory: %w", err)
+	}
+	if !info.IsDir() {
+		return Stats{}, fmt.Errorf("input path %q is not a directory", root)
+	}
+	files, err := supportedFiles(root)
+	if err != nil {
+		return Stats{}, err
+	}
+	if len(files) == 0 {
+		return Stats{}, errors.New("no supported OpenAPI (.json/.yaml/.yml) or SQL (.sql) files found")
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return Stats{}, err
+	}
+	defer tx.Rollback()
+	for _, table := range []string{"evidence", "relationships", "assets", "sources"} {
+		if _, err := tx.Exec("DELETE FROM " + table); err != nil {
+			return Stats{}, fmt.Errorf("clear previous %s: %w", table, err)
+		}
+	}
+	var stats Stats
+	for _, path := range files {
+		bytes, err := os.ReadFile(path)
+		if err != nil {
+			return Stats{}, fmt.Errorf("read %q: %w", path, err)
+		}
+		sourceID, err := insertSource(tx, path, bytes)
+		if err != nil {
+			return Stats{}, err
+		}
+		stats.Sources++
+		switch strings.ToLower(filepath.Ext(path)) {
+		case ".sql":
+			if err := ingestSQL(tx, sourceID, string(bytes), &stats); err != nil {
+				return Stats{}, fmt.Errorf("ingest SQL %q: %w", path, err)
+			}
+		default:
+			recognized, err := ingestOpenAPI(tx, sourceID, bytes, &stats)
+			if err != nil {
+				return Stats{}, fmt.Errorf("parse OpenAPI %q: %w", path, err)
+			}
+			if !recognized {
+				if _, err := tx.Exec(`DELETE FROM sources WHERE id = ?`, sourceID); err != nil {
+					return Stats{}, err
+				}
+				stats.Sources--
+			}
+		}
+	}
+	if stats.Sources == 0 {
+		return Stats{}, errors.New("no OpenAPI documents or SQL DDL files were recognized")
+	}
+	if err := tx.Commit(); err != nil {
+		return Stats{}, fmt.Errorf("commit ingestion: %w", err)
+	}
+	return stats, nil
+}
+
+func supportedFiles(root string) ([]string, error) {
+	var files []string
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		switch strings.ToLower(filepath.Ext(path)) {
+		case ".json", ".yaml", ".yml", ".sql":
+			files = append(files, path)
+		}
+		return nil
+	})
+	sort.Strings(files)
+	return files, err
+}
+
+func insertSource(tx *sql.Tx, path string, content []byte) (int64, error) {
+	sum := sha256.Sum256(content)
+	result, err := tx.Exec(`INSERT INTO sources(path, sha256) VALUES (?, ?)`, path, hex.EncodeToString(sum[:]))
+	if err != nil {
+		return 0, fmt.Errorf("record source %q: %w", path, err)
+	}
+	return result.LastInsertId()
+}
+
+func ingestOpenAPI(tx *sql.Tx, sourceID int64, content []byte, stats *Stats) (bool, error) {
+	var document map[string]any
+	if err := yaml.Unmarshal(content, &document); err != nil {
+		return false, err
+	}
+	if _, ok := document["openapi"].(string); !ok {
+		return false, nil
+	}
+	info := asMap(document["info"])
+	title, _ := info["title"].(string)
+	if title == "" {
+		title = "OpenAPI document"
+	}
+	apiID, err := insertAsset(tx, sourceID, "api", title, title, map[string]string{"openapi": fmt.Sprint(document["openapi"])}, "info")
+	if err != nil {
+		return true, err
+	}
+	stats.APIs++
+
+	schemas := asMap(asMap(document["components"])["schemas"])
+	schemaIDs := make(map[string]int64, len(schemas))
+	schemaNames := sortedKeys(schemas)
+	for _, name := range schemaNames {
+		id, err := insertAsset(tx, sourceID, "schema", name, name, map[string]string{}, "components.schemas."+name)
+		if err != nil {
+			return true, err
+		}
+		schemaIDs[name] = id
+		stats.Schemas++
+	}
+	paths := asMap(document["paths"])
+	for _, path := range sortedKeys(paths) {
+		pathItem := asMap(paths[path])
+		for _, method := range []string{"get", "put", "post", "delete", "options", "head", "patch", "trace"} {
+			rawOperation, exists := pathItem[method]
+			if !exists {
+				continue
+			}
+			operation := asMap(rawOperation)
+			if operation == nil {
+				continue
+			}
+			canonical := strings.ToUpper(method) + " " + path
+			name, _ := operation["operationId"].(string)
+			if name == "" {
+				name = canonical
+			}
+			locator := "paths." + path + "." + method
+			opID, err := insertAsset(tx, sourceID, "operation", name, canonical, map[string]string{"method": strings.ToUpper(method), "path": path}, locator)
+			if err != nil {
+				return true, err
+			}
+			stats.Operations++
+			if err := insertRelationship(tx, apiID, opID, "contains_operation", "declared", sourceID, locator); err != nil {
+				return true, err
+			}
+			references := make(map[string]struct{})
+			collectSchemaRefs(operation, references)
+			for _, schemaName := range sortedSet(references) {
+				schemaID, exists := schemaIDs[schemaName]
+				if !exists {
+					continue // External and missing component references are intentionally not guessed.
+				}
+				if err := insertRelationship(tx, opID, schemaID, "references_schema", "declared", sourceID, locator); err != nil {
+					return true, err
+				}
+			}
+		}
+	}
+	return true, nil
+}
+
+func ingestSQL(tx *sql.Tx, sourceID int64, text string, stats *Stats) error {
+	for _, match := range createTablePattern.FindAllStringSubmatch(stripSQLComments(text), -1) {
+		rawName := match[1]
+		name := tableLeafName(rawName)
+		if name == "" {
+			continue
+		}
+		if _, err := insertAsset(tx, sourceID, "table", name, normalizeSQLName(rawName), map[string]string{}, "CREATE TABLE "+strings.TrimSpace(rawName)); err != nil {
+			return err
+		}
+		stats.Tables++
+	}
+	return nil
+}
+
+func insertAsset(tx *sql.Tx, sourceID int64, kind, name, canonical string, attributes map[string]string, locator string) (int64, error) {
+	encoded, err := json.Marshal(attributes)
+	if err != nil {
+		return 0, err
+	}
+	result, err := tx.Exec(`INSERT INTO assets(source_id, kind, name, canonical_name, attributes) VALUES (?, ?, ?, ?, ?)`,
+		sourceID, kind, name, canonical, string(encoded))
+	if err != nil {
+		return 0, fmt.Errorf("record %s %q: %w", kind, name, err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	if _, err := tx.Exec(`INSERT INTO evidence(source_id, asset_id, locator) VALUES (?, ?, ?)`, sourceID, id, locator); err != nil {
+		return 0, fmt.Errorf("record asset evidence: %w", err)
+	}
+	return id, nil
+}
+
+func insertRelationship(tx *sql.Tx, fromID, toID int64, relationType, origin string, sourceID int64, locator string) error {
+	result, err := tx.Exec(`INSERT OR IGNORE INTO relationships(from_asset_id, to_asset_id, relationship_type, origin) VALUES (?, ?, ?, ?)`,
+		fromID, toID, relationType, origin)
+	if err != nil {
+		return err
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		return err
+	}
+	if id == 0 {
+		return nil
+	}
+	_, err = tx.Exec(`INSERT INTO evidence(source_id, relationship_id, locator) VALUES (?, ?, ?)`, sourceID, id, locator)
+	return err
+}
+
+// Build removes only inferred edges and adds the explicitly conservative v0 rule:
+// schema and table names must have an exact normalized match.
+func Build(db *sql.DB) (int, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM relationships WHERE origin = 'inferred'`); err != nil {
+		return 0, err
+	}
+	rows, err := tx.Query(`
+		SELECT s.id, s.name, s.source_id, t.id, t.name, t.source_id
+		FROM assets s JOIN assets t ON 1 = 1
+		WHERE s.kind = 'schema' AND t.kind = 'table'
+		ORDER BY s.name, s.id, t.name, t.id`)
+	if err != nil {
+		return 0, err
+	}
+	type matchCandidate struct {
+		schemaID, schemaSourceID, tableID, tableSourceID int64
+		schemaName, tableName                            string
+	}
+	var candidates []matchCandidate
+	for rows.Next() {
+		var candidate matchCandidate
+		if err := rows.Scan(&candidate.schemaID, &candidate.schemaName, &candidate.schemaSourceID,
+			&candidate.tableID, &candidate.tableName, &candidate.tableSourceID); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		candidates = append(candidates, candidate)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	count := 0
+	for _, candidate := range candidates {
+		if normalizeName(candidate.schemaName) != normalizeName(candidate.tableName) {
+			continue
+		}
+		if err := insertRelationship(tx, candidate.schemaID, candidate.tableID, "matches_table_name", "inferred",
+			candidate.schemaSourceID, "normalized-name:"+normalizeName(candidate.schemaName)); err != nil {
+			return 0, err
+		}
+		// Preserve both inputs as provenance for the derived conclusion.
+		var relationshipID int64
+		if err := tx.QueryRow(`SELECT id FROM relationships WHERE from_asset_id = ? AND to_asset_id = ? AND relationship_type = 'matches_table_name' AND origin = 'inferred'`,
+			candidate.schemaID, candidate.tableID).Scan(&relationshipID); err != nil {
+			return 0, err
+		}
+		if _, err := tx.Exec(`INSERT INTO evidence(source_id, relationship_id, locator)
+			SELECT ?, ?, ? WHERE NOT EXISTS (
+				SELECT 1 FROM evidence WHERE source_id = ? AND relationship_id = ? AND locator = ?)`,
+			candidate.tableSourceID, relationshipID, "normalized-name:"+normalizeName(candidate.tableName),
+			candidate.tableSourceID, relationshipID, "normalized-name:"+normalizeName(candidate.tableName)); err != nil {
+			return 0, err
+		}
+		count++
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func Explain(db *sql.DB, out io.Writer, name string) error {
+	asset, err := findAsset(db, name)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "%s: %s\n", asset.Kind, asset.Name)
+	if asset.CanonicalName != asset.Name {
+		fmt.Fprintf(out, "Canonical name: %s\n", asset.CanonicalName)
+	}
+	if asset.Attributes != "{}" {
+		fmt.Fprintf(out, "Attributes: %s\n", asset.Attributes)
+	}
+	if err := writeEvidence(db, out, "Evidence", "asset_id", asset.ID); err != nil {
+		return err
+	}
+	fmt.Fprintln(out, "Direct links:")
+	return writeRelations(db, out, asset.ID)
+}
+
+func Impact(db *sql.DB, out io.Writer, query string) error {
+	asset, err := findAsset(db, query)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "Direct impact graph for %s %q:\n", asset.Kind, asset.Name)
+	return writeRelations(db, out, asset.ID)
+}
+
+func findAsset(db *sql.DB, query string) (Asset, error) {
+	rows, err := db.Query(`SELECT id, kind, name, canonical_name, attributes
+		FROM assets WHERE name = ? OR canonical_name = ? ORDER BY kind, name, id`, query, query)
+	if err != nil {
+		return Asset{}, err
+	}
+	defer rows.Close()
+	var candidates []Asset
+	for rows.Next() {
+		var asset Asset
+		if err := rows.Scan(&asset.ID, &asset.Kind, &asset.Name, &asset.CanonicalName, &asset.Attributes); err != nil {
+			return Asset{}, err
+		}
+		candidates = append(candidates, asset)
+	}
+	if err := rows.Err(); err != nil {
+		return Asset{}, err
+	}
+	switch len(candidates) {
+	case 0:
+		return Asset{}, fmt.Errorf("no asset named %q", query)
+	case 1:
+		return candidates[0], nil
+	default:
+		names := make([]string, len(candidates))
+		for i, candidate := range candidates {
+			names[i] = candidate.Kind + ":" + candidate.Name
+		}
+		return Asset{}, fmt.Errorf("asset %q is ambiguous; candidates: %s", query, strings.Join(names, ", "))
+	}
+}
+
+func writeRelations(db *sql.DB, out io.Writer, assetID int64) error {
+	rows, err := db.Query(`
+		SELECT r.id, r.from_asset_id, r.to_asset_id, r.relationship_type, r.origin,
+		       f.kind, f.name, t.kind, t.name
+		FROM relationships r
+		JOIN assets f ON f.id = r.from_asset_id
+		JOIN assets t ON t.id = r.to_asset_id
+		WHERE r.from_asset_id = ? OR r.to_asset_id = ?
+		ORDER BY CASE WHEN r.from_asset_id = ? THEN 0 ELSE 1 END, r.relationship_type, f.kind, f.name, t.kind, t.name`,
+		assetID, assetID, assetID)
+	if err != nil {
+		return err
+	}
+	var relations []Relation
+	for rows.Next() {
+		var relation Relation
+		if err := rows.Scan(&relation.ID, &relation.FromID, &relation.ToID, &relation.Type, &relation.Origin,
+			&relation.FromKind, &relation.FromName, &relation.ToKind, &relation.ToName); err != nil {
+			rows.Close()
+			return err
+		}
+		relations = append(relations, relation)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	found := false
+	for _, relation := range relations {
+		direction := "OUT"
+		connectedKind, connectedName := relation.ToKind, relation.ToName
+		if relation.ToID == assetID {
+			direction = "IN"
+			connectedKind, connectedName = relation.FromKind, relation.FromName
+		}
+		fmt.Fprintf(out, "- %s %s [%s, %s] %s %q\n", direction, relation.Type, relation.Origin, direction, connectedKind, connectedName)
+		if err := writeEvidence(db, out, "  Evidence", "relationship_id", relation.ID); err != nil {
+			return err
+		}
+		found = true
+	}
+	if !found {
+		fmt.Fprintln(out, "- none")
+	}
+	return nil
+}
+
+func writeEvidence(db *sql.DB, out io.Writer, label, column string, id int64) error {
+	if column != "asset_id" && column != "relationship_id" {
+		return fmt.Errorf("unsupported evidence column %q", column)
+	}
+	rows, err := db.Query(`SELECT s.path, e.locator FROM evidence e JOIN sources s ON s.id = e.source_id WHERE e.`+column+` = ? ORDER BY s.path, e.locator`, id)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var references []string
+	for rows.Next() {
+		var path, locator string
+		if err := rows.Scan(&path, &locator); err != nil {
+			return err
+		}
+		references = append(references, path+" @ "+locator)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "%s: %s\n", label, strings.Join(references, "; "))
+	return nil
+}
+
+// Verify checks relational consistency and that every recorded source is still
+// present and byte-identical to the evidence used to construct the ledger.
+func Verify(db *sql.DB) error {
+	checks := []struct {
+		name, query string
+	}{
+		{"foreign-key violations", `PRAGMA foreign_key_check`},
+		{"assets without evidence", `SELECT a.id FROM assets a LEFT JOIN evidence e ON e.asset_id = a.id WHERE e.id IS NULL`},
+		{"relationships without evidence", `SELECT r.id FROM relationships r LEFT JOIN evidence e ON e.relationship_id = r.id WHERE e.id IS NULL`},
+		{"orphaned evidence", `SELECT e.id FROM evidence e LEFT JOIN sources s ON s.id = e.source_id WHERE s.id IS NULL`},
+	}
+	for _, check := range checks {
+		rows, err := db.Query(check.query)
+		if err != nil {
+			return fmt.Errorf("run %s check: %w", check.name, err)
+		}
+		if rows.Next() {
+			var id any
+			_ = rows.Scan(&id)
+			rows.Close()
+			return fmt.Errorf("verification failed: %s (record %v)", check.name, id)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
+	}
+	rows, err := db.Query(`SELECT path, sha256 FROM sources ORDER BY path`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var path, expected string
+		if err := rows.Scan(&path, &expected); err != nil {
+			return err
+		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("verification failed: source %q is unavailable: %w", path, err)
+		}
+		sum := sha256.Sum256(content)
+		if hex.EncodeToString(sum[:]) != expected {
+			return fmt.Errorf("verification failed: source %q changed since ingestion", path)
+		}
+	}
+	return rows.Err()
+}
+
+func asMap(value any) map[string]any {
+	if value == nil {
+		return nil
+	}
+	result, _ := value.(map[string]any)
+	return result
+}
+
+func collectSchemaRefs(value any, refs map[string]struct{}) {
+	switch typed := value.(type) {
+	case map[string]any:
+		if ref, ok := typed["$ref"].(string); ok && strings.HasPrefix(ref, "#/components/schemas/") {
+			refs[strings.TrimPrefix(ref, "#/components/schemas/")] = struct{}{}
+		}
+		for _, child := range typed {
+			collectSchemaRefs(child, refs)
+		}
+	case []any:
+		for _, child := range typed {
+			collectSchemaRefs(child, refs)
+		}
+	}
+}
+
+func sortedKeys(values map[string]any) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func sortedSet(values map[string]struct{}) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func normalizeName(value string) string {
+	var out strings.Builder
+	for _, r := range strings.ToLower(value) {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			out.WriteRune(r)
+		}
+	}
+	return out.String()
+}
+
+func normalizeSQLName(value string) string {
+	parts := strings.Split(value, ".")
+	for i := range parts {
+		parts[i] = strings.Trim(strings.TrimSpace(parts[i]), "`\"[]")
+	}
+	return strings.Join(parts, ".")
+}
+
+func tableLeafName(value string) string {
+	parts := strings.Split(normalizeSQLName(value), ".")
+	return parts[len(parts)-1]
+}
+
+func stripSQLComments(value string) string {
+	value = regexp.MustCompile(`(?s)/\*.*?\*/`).ReplaceAllString(value, " ")
+	return regexp.MustCompile(`(?m)--[^\n]*`).ReplaceAllString(value, "")
+}
