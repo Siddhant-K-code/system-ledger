@@ -1,42 +1,74 @@
+<p align="center">
+  <img src="docs/assets/system-ledger.svg" alt="System Ledger processing map: OpenAPI, AsyncAPI, SQL, and service metadata flow into a local SQLite evidence graph, queried by explain, impact, path, doctor, and verify." width="100%">
+</p>
+
 # system-ledger
 
-**Evidence-backed system maps and change impact analysis.**
+**Evidence-backed system maps and change impact analysis for engineers inheriting unfamiliar systems.**
 
-System Ledger is a local-first, self-hostable Go CLI for reconstructing a
-trustworthy architecture map from code and declarative artifacts. Point it at a
-service repository or a small multi-service checkout to answer:
+System Ledger is a local-first Go CLI that turns declarative source evidence
+into an inspectable architecture graph. It helps answer what changes for an
+asset, who owns it, and which direct links could break. The local SQLite ledger
+retains a source path and locator for every asset and relationship.
 
-- What directly changes for an asset or request?
-- Which configured service owns the affected source?
-- What direct API, schema, table, and ownership links could break?
+It makes no network calls, runs no hosted service, and has no LLM, embeddings,
+or external data dependency.
 
-The SQLite ledger is local. Source files and deterministic rules are the
-authority: System Ledger makes no network calls and has no hosted service,
-embeddings, or LLM-provider dependency.
+## See it work
 
-## Install
+The demo scans the checked-in multi-service example, builds conservative links,
+then follows an operation to its table with owner and evidence details.
+
+![Terminal recording: scan and build a System Ledger project, inspect its summary, find the listProducts to product path, then confirm doctor reports a healthy project.](docs/assets/demo.gif)
+
+[Static final frame](docs/assets/demo-preview.png) ·
+[Accessible command transcript](docs/assets/demo-transcript.txt) ·
+[Reproduce the recording](docs/recording.md)
+
+## Quick start
+
+Install the CLI:
 
 ```sh
 go install github.com/Siddhant-K-code/system-ledger/cmd/system-ledger@latest
+system-ledger --version
 ```
 
-Or run it from a clone with `go run ./cmd/system-ledger`.
-
-## Five-minute quick start
-
-Initialize from the repository root. This creates `system-ledger.yaml` only if
-it is absent and creates the predictable local database at
-`.system-ledger/ledger.db`.
+Or build a reproducible local binary from a clone:
 
 ```sh
-cd your-system
-system-ledger init
+go build -o bin/system-ledger ./cmd/system-ledger
+./bin/system-ledger --version
 ```
 
-Describe each service with a project-relative source directory:
+Run the included example in a disposable copy. Its manifest defines two service
+owners, OpenAPI documents, and SQL tables:
+
+```sh
+project="$(mktemp -d)"
+cp -R examples/multi-service/. "$project/"
+
+system-ledger scan --project "$project"
+system-ledger build --project "$project"
+system-ledger summary --project "$project"
+system-ledger path --project "$project" listProducts product
+system-ledger doctor --project "$project"
+system-ledger verify --project "$project"
+
+rm -rf "$project"
+```
+
+For a new project, initialize before adding sources:
+
+```sh
+system-ledger init --project /path/to/system
+```
+
+`init` creates a non-destructive `system-ledger.yaml` and the local ledger path
+`<project>/.system-ledger/ledger.db`. Add one project-relative source root per
+service:
 
 ```yaml
-# system-ledger.yaml
 version: 1
 services:
   - name: catalog-service
@@ -44,152 +76,85 @@ services:
     source: services/catalog
     domain: commerce
     tags: [api, catalog]
-  - name: orders-service
-    owner: fulfillment-platform
-    source: services/orders
-    domain: fulfillment
-    tags: [api, orders]
 ```
 
-Scan source evidence, construct conservative derived links, then inspect it:
+## What the CLI reports
 
-```sh
-system-ledger scan
-system-ledger build
-system-ledger summary
-system-ledger impact Product
-system-ledger path listProducts product
-system-ledger doctor
-system-ledger verify
-```
+| Task | Command | Result |
+| --- | --- | --- |
+| Discover evidence | `scan` | Deterministically finds supported source files and maps them to configured services. |
+| Construct safe links | `build` | Rebuilds only conservative derived links. |
+| Orient yourself | `summary` | Shows services, owners, assets, relationships, timestamps, and validation warnings. |
+| Inspect an asset | `explain <name>` | Shows attributes, ownership, direct links, and source locators. |
+| Assess direct change impact | `impact <name>` | Shows an asset's direct incoming and outgoing links. |
+| Trace a dependency | `path <from> <to>` | Finds the deterministic shortest directed path, with relationship origin and evidence. |
+| Diagnose project health | `doctor` | Checks manifest, roots, source drift, and whether a build is current. |
+| Gate automation | `verify` | Enforces ledger, service-root, and evidence integrity. |
 
-For a runnable example, use the checked-in multi-service fixture:
+All commands accept `--project <directory>` and `--db <path>` when an explicit
+database location is needed. `init`, `explain`, `impact`, `path`, `summary`,
+`doctor`, and `verify` accept `--format text|json`; JSON is raw, stable, and
+machine-readable. Text respects `NO_COLOR` and `--color auto|always|never`.
 
-```sh
-cd examples/multi-service
-go run ../../cmd/system-ledger init
-go run ../../cmd/system-ledger scan
-go run ../../cmd/system-ledger build
-go run ../../cmd/system-ledger impact Product
-```
-
-The final command reports the direct `Product -> product` inferred match, its
-incoming API operation, ownership by `catalog-service`, relationship origins,
-and source/locator evidence.
-
-## Commands and project scope
-
-| Command | Purpose |
-| --- | --- |
-| `init [directory]` | Idempotently creates the manifest and ledger location. |
-| `scan` | Discovers supported files under the project and applies service ownership. |
-| `ingest <directory>` | Compatibility mode for one in-project source directory without service association. |
-| `build` | Rebuilds only deterministic inferred links. |
-| `summary` | Lists services, asset counts, relationship counts, and validation warnings. |
-| `explain <name>` | Shows an asset's attributes, owner, direct links, and evidence. |
-| `impact <query>` | Shows the direct, evidence-backed dependency graph for an asset. |
-| `path <from> <to>` | Finds the deterministic shortest path across direct ledger relationships. |
-| `verify` | Checks relational integrity, service roots, source provenance, and evidence. |
-| `doctor` | Diagnoses manifest, scan/build freshness, service roots, and evidence drift. |
-
-Every command accepts `--project <directory>`; it defaults to the current
-directory. The default database is `<project>/.system-ledger/ledger.db`.
-`--db <path>` remains available for scripts and existing usage. `explain`,
-`impact`, `path`, `summary`, `verify`, `doctor`, and `init` support
-`--format text|json`; JSON uses stable structs and deterministic ordering for
-automation. Human output honors `--color auto|always|never` and `NO_COLOR`;
-auto styling is enabled only for a terminal, so CI output stays plain.
-
-`system-ledger --version` prints the build version (`dev` for local builds).
-Release builds may set it with `go build -ldflags '-X main.version=vX.Y.Z'`.
-
-`scan` only traverses the project root, ignores `.git`, `.system-ledger`,
-`node_modules`, and `vendor`, and does not follow directories outside the
-project. Service `source` values must be existing directories inside the
-project. `ingest` likewise rejects a directory outside `--project`.
-
-## Evidence model and supported sources
-
-Each extracted asset and relationship records a source path and locator in
-SQLite. Paths are project-relative. `verify` confirms the configuration's
-source roots still exist, the stored sources remain under the project root, and
-their bytes still match the last scan. It exits nonzero with remediation hints
-when an issue is found.
-
-Current supported evidence:
-
-- **OpenAPI 3 JSON/YAML:** API documents, operations, component schemas,
-  API-to-operation containment, and local
-  `#/components/schemas/...` operation references.
-- **SQL `.sql` files:** conventional `CREATE TABLE`, optional `IF NOT EXISTS`,
-  temporary tables, quoted identifiers, and simple schema-qualified names.
-- **Manifest services:** explicit service name, owner/team, source, optional
-  domain, and tags. Assets in a configured source directory receive a
-  `source-derived` `owns_asset` link with manifest evidence.
-- **AsyncAPI 2.x/3.x JSON/YAML:** document assets, channels, inline
-  `publish`/`subscribe` messages, component schemas, and local schema
-  references. System Ledger does not infer producers or consumers from channel
-  names or descriptive text.
-
-`build` adds one deliberately narrow inference: a schema and SQL table have a
-`matches_table_name` edge only when their names exactly match after lowercasing
-and removing non-alphanumeric characters. Parser-observed links are
-`declared`, manifest associations are `source-derived`, and derived links are
-`inferred`. System Ledger does not make fuzzy, semantic, singularization, or
-cross-file guesses.
-
-SQL columns, constraints, views, stored procedures, dynamic SQL, and
-vendor-specific extensions are intentionally unsupported in this release.
-Non-OpenAPI YAML/JSON candidate files are counted as skipped by `scan`; invalid
-supported OpenAPI documents fail explicitly rather than being guessed.
-
-## Reproducibility
-
-Re-running `scan` replaces extracted material with a deterministic file walk
-and deterministic ordering. Re-running `build` replaces only inferred edges.
-The manifest and source content are evidence, so outputs remain inspectable
-and `verify` catches drift before results are trusted.
-
-## Operational checks
-
-`doctor` exits zero for a healthy ledger and for advisory warnings (for example,
-when `scan` completed but `build` has not run). It exits nonzero for broken
-manifests, invalid service roots, missing or changed evidence, and relational
-integrity failures. Each failing text check includes the exact repair command.
-`verify` is the stricter CI gate and exits nonzero for any validation issue.
-
-Example:
+Example path output:
 
 ```text
-$ system-ledger summary
-Sources: 5 | Services: 2 | APIs: 2 | Operations: 2 | Schemas: 2 | Tables: 2
-Services:
-- catalog-service (owner: commerce-platform, source: services/catalog)
-
 $ system-ledger path listProducts product
 Path: operation "listProducts" -> table "product"
 1. outgoing references_schema [declared] schema "Product" (owner: catalog-service)
-2. outgoing matches_table_name [inferred] table "product"
-
-$ system-ledger doctor
-OK  manifest   Manifest is valid.
-OK  evidence   Ledger evidence and service roots are valid.
-OK  build      Ledger is built from the latest scan.
+   services/catalog/openapi.yaml @ paths./products.get
+2. outgoing matches_table_name [inferred] table "product" (owner: catalog-service)
+   services/catalog/openapi.yaml @ normalized-name:product
+   services/catalog/schema.sql @ normalized-name:product
 ```
 
-## Roadmap
+## Evidence rules and supported input
 
-**Current:** local OpenAPI and SQL DDL reconstruction, service ownership,
-direct impact maps, provenance, integrity verification, and text/JSON reports.
+| Source | Extracted facts | Relationship origin |
+| --- | --- | --- |
+| OpenAPI 3 JSON/YAML | APIs, operations, component schemas, local schema references | `declared` |
+| AsyncAPI 2.x/3.x JSON/YAML | Documents, channels, inline publish/subscribe messages, component schemas, local payload references | `declared` |
+| SQL `.sql` | Conventional `CREATE TABLE` identifiers | Assets only |
+| `system-ledger.yaml` | Service name, owner, source root, optional domain and tags | `source-derived` |
+| `build` | Exact normalized schema/table name matches | `inferred` |
 
-**Future ideas (not implemented):** additional deterministic parsers,
-cross-repository aggregation, richer declared dependency formats, and an
-optional independently-auditable extraction layer. Hosted ingestion,
-embeddings, and LLM-provider integrations are intentionally out of scope.
+The renderer never treats an inferred link as declared. It does not make fuzzy
+matches, singularization guesses, semantic guesses, or producer/consumer
+claims from prose. Every reported relationship includes the source evidence
+that caused it.
 
-## Development
+`scan` limits traversal to the project root and ignores `.git`,
+`.system-ledger`, `node_modules`, and `vendor`. Service roots must remain
+inside the project. SQL support intentionally excludes columns, constraints,
+views, procedures, dynamic SQL, and vendor-specific extensions. AsyncAPI
+support intentionally covers local component schema references and inline
+channel messages only.
+
+## Operations and verification
+
+Run `scan` after source or manifest changes, then `build`. `doctor` exits zero
+for a healthy project and advisory warnings such as an unbuilt recent scan. It
+exits nonzero for broken configuration, missing service roots, source drift, or
+ledger failures. `verify` is the strict CI gate and exits nonzero for every
+validation issue.
+
+```sh
+system-ledger doctor --project . --format json
+system-ledger verify --project . --format json
+```
+
+## Develop
 
 ```sh
 go test ./...
+go vet ./...
 go build ./cmd/system-ledger
 ```
+
+Contributions should preserve deterministic ordering, local provenance, and
+explicit inference rules. Please include a focused fixture or test when
+extending an extractor or graph rule.
+
+## License
+
+[MIT](LICENSE).

@@ -1,0 +1,33 @@
+$ system-ledger scan
+Scan complete
+Scanned 5 candidate files: 4 sources, 2 services, 2 APIs, 2 operations, 2 schemas, 2 tables.
+Skipped 1 YAML/JSON files that are not OpenAPI documents.
+
+$ system-ledger build
+Build complete
+Built 2 inferred relationships.
+
+$ system-ledger summary
+Sources: 5 | Services: 2 | APIs: 2 | Operations: 2 | Schemas: 2 | Tables: 2
+Last scan: 2026-09-06T08:07:56Z | Last build: 2026-09-06T08:07:56Z
+Services:
+- catalog-service (owner: commerce-platform, source: services/catalog)
+- orders-service (owner: fulfillment-platform, source: services/orders)
+Relationships:
+- contains_operation [declared]: 2
+- matches_table_name [inferred]: 2
+- owns_asset [source-derived]: 8
+- references_schema [declared]: 2
+
+$ system-ledger path listProducts product
+Path: operation "listProducts" -> table "product"
+1. outgoing references_schema [declared] schema "Product" (owner: catalog-service)
+   services/catalog/openapi.yaml @ paths./products.get
+2. outgoing matches_table_name [inferred] table "product" (owner: catalog-service)
+   services/catalog/openapi.yaml @ normalized-name:product
+   services/catalog/schema.sql @ normalized-name:product
+
+$ system-ledger doctor
+OK  manifest   Manifest is valid.
+OK  evidence   Ledger evidence and service roots are valid.
+OK  build      Ledger is built from the latest scan.
