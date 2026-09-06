@@ -9,7 +9,7 @@ Built 2 inferred relationships.
 
 $ system-ledger summary
 Sources: 5 | Services: 2 | APIs: 2 | Operations: 2 | Schemas: 2 | Tables: 2
-Last scan: 2026-09-06T08:07:56Z | Last build: 2026-09-06T08:07:56Z
+Last scan: 2026-09-06T08:16:10Z | Last build: 2026-09-06T08:16:10Z
 Services:
 - catalog-service (owner: commerce-platform, source: services/catalog)
 - orders-service (owner: fulfillment-platform, source: services/orders)

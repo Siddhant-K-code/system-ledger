@@ -8,33 +8,31 @@ binary at the current commit. The matching accessible transcript is
 
 ## Regenerate
 
-The portable recording source is [`assets/demo.tape`](assets/demo.tape). It is
-validated with [Charmbracelet VHS](https://github.com/charmbracelet/vhs) and
-uses a 1100×680 viewport, 19px Menlo text, and clear command boundaries:
+The source is [`assets/demo.tape`](assets/demo.tape), recorded with
+[Charmbracelet VHS](https://github.com/charmbracelet/vhs). The canonical
+regeneration command is:
 
 ```sh
+scripts/record-demo.sh
+```
+
+The wrapper requires Go, VHS, `ffmpeg`, and `ttyd`. It builds a temporary
+binary, copies `examples/multi-service` into a fresh temporary project, runs
+the real commands there, writes `demo.gif`, extracts a path-focused static
+preview, writes the corresponding real-output transcript, and removes its
+temporary files. It does not modify the example or its working-tree ledger.
+
+Install the recording dependencies with your package manager, then put VHS on
+your `PATH`:
+
+```sh
+brew install ffmpeg ttyd
+go install github.com/charmbracelet/vhs@v0.10.0
+export PATH="$(go env GOPATH)/bin:$PATH"
 vhs validate docs/assets/demo.tape
+scripts/record-demo.sh
 ```
 
-When VHS and `ffmpeg` are installed, render the tape directly:
-
-```sh
-cd examples/multi-service
-PATH="/path/to/locally-built-binary:$PATH" vhs ../../docs/assets/demo.tape \
-  --output ../../docs/assets/demo.gif
-```
-
-The committed media was generated through the reproducible fallback below
-because the capture environment had VHS but no `ffmpeg` encoder. It creates a
-temporary project copy, runs the actual commands, captures their output, and
-renders the terminal frames using Pillow. It never changes the example,
-manifest, or ledger in the working tree.
-
-```sh
-python3 -m venv /tmp/system-ledger-demo-venv
-/tmp/system-ledger-demo-venv/bin/pip install Pillow
-PYTHON_BIN=/tmp/system-ledger-demo-venv/bin/python scripts/record-demo.sh
-```
-
-The helper requires Go and Python 3 with Pillow. VHS rendering requires VHS
-and `ffmpeg`; `ttyd` is not needed for this noninteractive command sequence.
+The tape uses a 1040×500 viewport, 18px Menlo text, visible typed commands,
+and output holds. It records `scan`, `build`, `summary`,
+`path listProducts product`, and `doctor`.

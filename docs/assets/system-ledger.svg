@@ -16,9 +16,10 @@
       .source { fill: none; stroke: #8b6a32; stroke-width: 2; stroke-dasharray: 6 5; marker-end: url(#arrow); }
       .inferred { fill: none; stroke: #638a58; stroke-width: 2; stroke-dasharray: 2 5; marker-end: url(#arrow); }
       .heading { font: 700 23px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; fill: #192235; }
-      .label { font: 600 15px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; fill: #243148; }
-      .detail { font: 13px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; fill: #526176; }
-      .tag { font: 600 12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; fill: #526176; }
+      .label { font: 600 17px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; fill: #243148; }
+      .detail { font: 15px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; fill: #526176; }
+      .tag { font: 600 14px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; fill: #526176; }
+      .note { font: 15px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; fill: #526176; }
     </style>
   </defs>
   <rect class="canvas" width="1200" height="560" rx="18"/>
@@ -34,26 +35,26 @@
   <rect class="node" x="72" y="300" width="196" height="43" rx="7"/>
   <text class="label" x="88" y="327">SQL CREATE TABLE</text>
   <rect class="node" x="72" y="356" width="196" height="58" rx="7"/>
-  <text class="label" x="88" y="382">system-ledger.yaml</text>
-  <text class="detail" x="88" y="402">service, owner, source</text>
+  <text class="label" x="88" y="382">ledger manifest</text>
+  <text class="detail" x="88" y="402">service metadata</text>
 
   <path class="line" d="M292 265 H430"/>
   <text class="tag" x="322" y="246">parse + hash</text>
-  <rect class="ledger" x="430" y="164" width="350" height="250" rx="12"/>
-  <text class="label" x="456" y="202">Local SQLite evidence graph</text>
-  <line x1="456" y1="219" x2="754" y2="219" stroke="#b8c5d9"/>
-  <text class="detail" x="456" y="250">assets</text>
-  <text class="detail" x="612" y="250">relationships</text>
-  <text class="detail" x="456" y="278">sources</text>
-  <text class="detail" x="612" y="278">evidence</text>
-  <text class="detail" x="456" y="321">API / operation / schema / table</text>
-  <text class="detail" x="456" y="346">channel / message / service</text>
-  <path class="declared" d="M456 376 H533"/>
-  <text class="tag" x="544" y="380">declared</text>
-  <path class="source" d="M622 376 H699"/>
-  <text class="tag" x="710" y="380">source-derived</text>
-  <path class="inferred" d="M456 399 H533"/>
-  <text class="tag" x="544" y="403">inferred</text>
+  <rect class="ledger" x="430" y="150" width="350" height="304" rx="12"/>
+  <text class="label" x="456" y="190">Local SQLite evidence graph</text>
+  <line x1="456" y1="208" x2="754" y2="208" stroke="#b8c5d9"/>
+  <text class="detail" x="456" y="242">assets</text>
+  <text class="detail" x="612" y="242">relationships</text>
+  <text class="detail" x="456" y="272">sources</text>
+  <text class="detail" x="612" y="272">evidence</text>
+  <text class="detail" x="456" y="318">API / operation / schema / table</text>
+  <text class="detail" x="456" y="344">channel / message / service</text>
+  <path class="declared" d="M456 376 H530"/>
+  <text class="tag" x="544" y="381">declared</text>
+  <path class="source" d="M456 404 H530"/>
+  <text class="tag" x="544" y="409">source-derived</text>
+  <path class="inferred" d="M456 432 H530"/>
+  <text class="tag" x="544" y="437">inferred</text>
 
   <path class="line" d="M780 289 H908"/>
   <text class="tag" x="804" y="270">query locally</text>
@@ -67,6 +68,7 @@
   <text class="label" x="948" y="313">path</text>
   <rect class="query" x="932" y="338" width="196" height="38" rx="7"/>
   <text class="label" x="948" y="363">doctor / verify</text>
-  <text class="detail" x="932" y="410">owner + source locator</text>
-  <text class="detail" x="932" y="430">in every reported link</text>
+  <text class="detail" x="932" y="410">direct, source-backed</text>
+  <text class="detail" x="932" y="430">dependency answers</text>
+  <text class="note" x="600" y="516" text-anchor="middle">Evidence processing map only: it does not claim runtime calls or data lineage.</text>
 </svg>

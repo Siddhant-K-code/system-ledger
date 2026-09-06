@@ -2,16 +2,27 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+vhs_bin="${VHS_BIN:-vhs}"
 workspace="$(mktemp -d)"
 binary="$workspace/system-ledger"
 project="$workspace/project"
 logs="$workspace/logs"
-python_bin="${PYTHON_BIN:-python3}"
 
 cleanup() {
   rm -rf "$workspace"
 }
 trap cleanup EXIT
+
+require() {
+  command -v "$1" >/dev/null || {
+    echo "Required recorder dependency is unavailable: $1" >&2
+    exit 1
+  }
+}
+
+require "$vhs_bin"
+require ffmpeg
+require ttyd
 
 go build -o "$binary" "$root/cmd/system-ledger"
 mkdir -p "$project" "$logs"
@@ -32,13 +43,28 @@ capture summary summary
 capture path path listProducts product
 capture doctor doctor
 
-"$python_bin" -c 'from PIL import Image' 2>/dev/null || {
-  echo "Pillow is required. Set PYTHON_BIN to a Python environment with Pillow installed." >&2
-  exit 1
-}
+{
+  for name in scan build summary path doctor; do
+    case "$name" in
+      scan) command="system-ledger scan" ;;
+      build) command="system-ledger build" ;;
+      summary) command="system-ledger summary" ;;
+      path) command="system-ledger path listProducts product" ;;
+      doctor) command="system-ledger doctor" ;;
+    esac
+    printf '$ %s\n' "$command"
+    cat "$logs/$name.txt"
+    if [[ "$name" != "doctor" ]]; then
+      printf '\n'
+    fi
+  done
+} >"$root/docs/assets/demo-transcript.txt"
 
-"$python_bin" "$root/scripts/render-demo.py" \
-  --logs "$logs" \
-  --gif "$root/docs/assets/demo.gif" \
-  --preview "$root/docs/assets/demo-preview.png" \
-  --transcript "$root/docs/assets/demo-transcript.txt"
+(
+  cd "$project"
+  PATH="$workspace:$PATH" "$vhs_bin" "$root/docs/assets/demo.tape" \
+    --output "$root/docs/assets/demo.gif" --quiet
+)
+
+ffmpeg -y -ss 13 -i "$root/docs/assets/demo.gif" -frames:v 1 \
+    "$root/docs/assets/demo-preview.png" >/dev/null 2>&1

@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="docs/assets/system-ledger.svg" alt="System Ledger processing map: OpenAPI, AsyncAPI, SQL, and service metadata flow into a local SQLite evidence graph, queried by explain, impact, path, doctor, and verify." width="100%">
-</p>
-
 # system-ledger
 
 **Evidence-backed system maps and change impact analysis for engineers inheriting unfamiliar systems.**
@@ -25,43 +21,56 @@ then follows an operation to its table with owner and evidence details.
 [Accessible command transcript](docs/assets/demo-transcript.txt) ·
 [Reproduce the recording](docs/recording.md)
 
+## How it works
+
+<img src="docs/assets/system-ledger.svg" alt="System Ledger processing map: OpenAPI, AsyncAPI, SQL, and service metadata flow into a local SQLite evidence graph, queried by explain, impact, path, doctor, and verify." width="100%">
+
+The diagram is a processing and dependency model, not a claim to discover
+runtime calls or data lineage.
+
 ## Quick start
 
-Install the CLI:
+**Requirements:** Go 1.23 or newer.
+
+### Install for your own project
 
 ```sh
 go install github.com/Siddhant-K-code/system-ledger/cmd/system-ledger@latest
 system-ledger --version
 ```
 
-Or build a reproducible local binary from a clone:
-
-```sh
-go build -o bin/system-ledger ./cmd/system-ledger
-./bin/system-ledger --version
-```
-
-Run the included example in a disposable copy. Its manifest defines two service
-owners, OpenAPI documents, and SQL tables:
-
-```sh
-project="$(mktemp -d)"
-cp -R examples/multi-service/. "$project/"
-
-system-ledger scan --project "$project"
-system-ledger build --project "$project"
-system-ledger summary --project "$project"
-system-ledger path --project "$project" listProducts product
-system-ledger doctor --project "$project"
-system-ledger verify --project "$project"
-
-rm -rf "$project"
-```
-
-For a new project, initialize before adding sources:
+Initialize an existing source directory, add service roots to the manifest, and
+run the scan/build cycle:
 
 ```sh
 system-ledger init --project /path/to/system
+# Edit /path/to/system/system-ledger.yaml
+system-ledger scan --project /path/to/system
+system-ledger build --project /path/to/system
+system-ledger summary --project /path/to/system
+```
+
+### Clone and run the included demo
+
+Start from an empty working folder. The checked-in example has two services,
+owners, OpenAPI documents, and SQL tables:
+
+```sh
+git clone https://github.com/Siddhant-K-code/system-ledger.git
+cd system-ledger
+go build -o bin/system-ledger ./cmd/system-ledger
+
+project="$(mktemp -d)"
+cp -R examples/multi-service/. "$project/"
+
+./bin/system-ledger scan --project "$project"
+./bin/system-ledger build --project "$project"
+./bin/system-ledger summary --project "$project"
+./bin/system-ledger path --project "$project" listProducts product
+./bin/system-ledger doctor --project "$project"
+./bin/system-ledger verify --project "$project"
+
+rm -rf "$project"
 ```
 
 `init` creates a non-destructive `system-ledger.yaml` and the local ledger path
@@ -91,10 +100,11 @@ services:
 | Diagnose project health | `doctor` | Checks manifest, roots, source drift, and whether a build is current. |
 | Gate automation | `verify` | Enforces ledger, service-root, and evidence integrity. |
 
-All commands accept `--project <directory>` and `--db <path>` when an explicit
-database location is needed. `init`, `explain`, `impact`, `path`, `summary`,
+Project commands accept `--project <directory>` and `--db <path>` when an
+explicit database location is needed. `--version` prints the build version and
+does not take project flags. `init`, `explain`, `impact`, `path`, `summary`,
 `doctor`, and `verify` accept `--format text|json`; JSON is raw, stable, and
-machine-readable. Text respects `NO_COLOR` and `--color auto|always|never`.
+machine-readable. Use each command's `--help` for its complete flag contract.
 
 Example path output:
 

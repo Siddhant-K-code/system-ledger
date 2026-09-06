@@ -1,13 +1,13 @@
 Output demo.gif
 Set Shell "bash"
 Set FontFamily "Menlo"
-Set FontSize 19
-Set Width 1100
-Set Height 680
-Set Padding 28
+Set FontSize 18
+Set Width 1040
+Set Height 500
+Set Padding 20
 Set Margin 0
 Set Theme "Dracula"
-Set TypingSpeed 28ms
+Set TypingSpeed 22ms
 Set CursorBlink false
 
 Type "system-ledger scan"
@@ -32,4 +32,4 @@ Ctrl+L
 
 Type "system-ledger doctor"
 Enter
-Sleep 5s
+Sleep 7s
