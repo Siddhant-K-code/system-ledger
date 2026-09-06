@@ -58,6 +58,8 @@ system-ledger scan
 system-ledger build
 system-ledger summary
 system-ledger impact Product
+system-ledger path listProducts product
+system-ledger doctor
 system-ledger verify
 ```
 
@@ -86,13 +88,20 @@ and source/locator evidence.
 | `summary` | Lists services, asset counts, relationship counts, and validation warnings. |
 | `explain <name>` | Shows an asset's attributes, owner, direct links, and evidence. |
 | `impact <query>` | Shows the direct, evidence-backed dependency graph for an asset. |
+| `path <from> <to>` | Finds the deterministic shortest path across direct ledger relationships. |
 | `verify` | Checks relational integrity, service roots, source provenance, and evidence. |
+| `doctor` | Diagnoses manifest, scan/build freshness, service roots, and evidence drift. |
 
 Every command accepts `--project <directory>`; it defaults to the current
 directory. The default database is `<project>/.system-ledger/ledger.db`.
 `--db <path>` remains available for scripts and existing usage. `explain`,
-`impact`, `summary`, and `verify` support `--format text|json`; JSON uses
-stable structs and deterministic ordering for automation.
+`impact`, `path`, `summary`, `verify`, `doctor`, and `init` support
+`--format text|json`; JSON uses stable structs and deterministic ordering for
+automation. Human output honors `--color auto|always|never` and `NO_COLOR`;
+auto styling is enabled only for a terminal, so CI output stays plain.
+
+`system-ledger --version` prints the build version (`dev` for local builds).
+Release builds may set it with `go build -ldflags '-X main.version=vX.Y.Z'`.
 
 `scan` only traverses the project root, ignores `.git`, `.system-ledger`,
 `node_modules`, and `vendor`, and does not follow directories outside the
@@ -117,6 +126,10 @@ Current supported evidence:
 - **Manifest services:** explicit service name, owner/team, source, optional
   domain, and tags. Assets in a configured source directory receive a
   `source-derived` `owns_asset` link with manifest evidence.
+- **AsyncAPI 2.x/3.x JSON/YAML:** document assets, channels, inline
+  `publish`/`subscribe` messages, component schemas, and local schema
+  references. System Ledger does not infer producers or consumers from channel
+  names or descriptive text.
 
 `build` adds one deliberately narrow inference: a schema and SQL table have a
 `matches_table_name` edge only when their names exactly match after lowercasing
@@ -136,6 +149,33 @@ Re-running `scan` replaces extracted material with a deterministic file walk
 and deterministic ordering. Re-running `build` replaces only inferred edges.
 The manifest and source content are evidence, so outputs remain inspectable
 and `verify` catches drift before results are trusted.
+
+## Operational checks
+
+`doctor` exits zero for a healthy ledger and for advisory warnings (for example,
+when `scan` completed but `build` has not run). It exits nonzero for broken
+manifests, invalid service roots, missing or changed evidence, and relational
+integrity failures. Each failing text check includes the exact repair command.
+`verify` is the stricter CI gate and exits nonzero for any validation issue.
+
+Example:
+
+```text
+$ system-ledger summary
+Sources: 5 | Services: 2 | APIs: 2 | Operations: 2 | Schemas: 2 | Tables: 2
+Services:
+- catalog-service (owner: commerce-platform, source: services/catalog)
+
+$ system-ledger path listProducts product
+Path: operation "listProducts" -> table "product"
+1. outgoing references_schema [declared] schema "Product" (owner: catalog-service)
+2. outgoing matches_table_name [inferred] table "product"
+
+$ system-ledger doctor
+OK  manifest   Manifest is valid.
+OK  evidence   Ledger evidence and service roots are valid.
+OK  build      Ledger is built from the latest scan.
+```
 
 ## Roadmap
 

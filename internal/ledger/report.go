@@ -47,6 +47,8 @@ type SummaryReport struct {
 	Assets        AssetCounts           `json:"assets"`
 	Relationships []RelationshipSummary `json:"relationships"`
 	Sources       int                   `json:"sources"`
+	LastScanAt    string                `json:"last_scan_at,omitempty"`
+	LastBuildAt   string                `json:"last_build_at,omitempty"`
 	Warnings      []string              `json:"warnings"`
 }
 
@@ -233,6 +235,13 @@ func WriteSummary(db *sql.DB, out io.Writer, format string) error {
 	}
 	fmt.Fprintf(out, "Sources: %d | Services: %d | APIs: %d | Operations: %d | Schemas: %d | Tables: %d\n",
 		report.Sources, report.Assets.Services, report.Assets.APIs, report.Assets.Operations, report.Assets.Schemas, report.Assets.Tables)
+	if report.LastScanAt != "" {
+		fmt.Fprintf(out, "Last scan: %s", report.LastScanAt)
+		if report.LastBuildAt != "" {
+			fmt.Fprintf(out, " | Last build: %s", report.LastBuildAt)
+		}
+		fmt.Fprintln(out)
+	}
 	fmt.Fprintln(out, "Services:")
 	if len(report.Services) == 0 {
 		fmt.Fprintln(out, "- none configured")
@@ -267,6 +276,8 @@ func Summary(db *sql.DB) (SummaryReport, error) {
 	if err := db.QueryRow(`SELECT COUNT(*) FROM sources`).Scan(&report.Sources); err != nil {
 		return SummaryReport{}, err
 	}
+	report.LastScanAt = metadata(db, "last_scan_at")
+	report.LastBuildAt = metadata(db, "last_build_at")
 	rows, err := db.Query(`SELECT kind, COUNT(*) FROM assets GROUP BY kind ORDER BY kind`)
 	if err != nil {
 		return SummaryReport{}, err

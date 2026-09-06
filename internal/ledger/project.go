@@ -142,6 +142,9 @@ func Scan(db *sql.DB, projectRoot string) (ScanResult, error) {
 	if err := attachServices(db, root, config); err != nil {
 		return ScanResult{}, err
 	}
+	if err := RecordScan(db); err != nil {
+		return ScanResult{}, fmt.Errorf("record scan: %w", err)
+	}
 	stats.Services = len(config.Services)
 	return ScanResult{Stats: stats}, nil
 }

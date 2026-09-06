@@ -224,9 +224,16 @@ func Ingest(db *sql.DB, root string) (Stats, error) {
 				return Stats{}, fmt.Errorf("parse OpenAPI %q: %w", path, err)
 			}
 			if !recognized {
+				recognized, err = ingestAsyncAPI(tx, sourceID, bytes, &stats)
+				if err != nil {
+					return Stats{}, fmt.Errorf("parse AsyncAPI %q: %w", path, err)
+				}
+			}
+			if !recognized {
 				if _, err := tx.Exec(`DELETE FROM sources WHERE id = ?`, sourceID); err != nil {
 					return Stats{}, err
 				}
+
 				stats.Sources--
 				stats.SkippedFiles++
 			}
@@ -239,6 +246,77 @@ func Ingest(db *sql.DB, root string) (Stats, error) {
 		return Stats{}, fmt.Errorf("commit ingestion: %w", err)
 	}
 	return stats, nil
+}
+
+func ingestAsyncAPI(tx *sql.Tx, sourceID int64, content []byte, stats *Stats) (bool, error) {
+	var document map[string]any
+	if err := yaml.Unmarshal(content, &document); err != nil {
+		return false, err
+	}
+	version, ok := document["asyncapi"].(string)
+	if !ok {
+		return false, nil
+	}
+	if !strings.HasPrefix(version, "2.") && !strings.HasPrefix(version, "3.") {
+		return false, fmt.Errorf("unsupported AsyncAPI version %q; v0 supports 2.x and 3.x channel/message structures", version)
+	}
+	title, _ := asMap(document["info"])["title"].(string)
+	if title == "" {
+		title = "AsyncAPI document"
+	}
+	apiID, err := insertAsset(tx, sourceID, "asyncapi", title, title, map[string]string{"asyncapi": version}, "info")
+	if err != nil {
+		return true, err
+	}
+	stats.APIs++
+	schemas := asMap(asMap(document["components"])["schemas"])
+	schemaIDs := make(map[string]int64, len(schemas))
+	for _, name := range sortedKeys(schemas) {
+		id, err := insertAsset(tx, sourceID, "schema", name, name, map[string]string{}, "components.schemas."+name)
+		if err != nil {
+			return true, err
+		}
+		schemaIDs[name] = id
+		stats.Schemas++
+	}
+	for _, channelName := range sortedKeys(asMap(document["channels"])) {
+		channelID, err := insertAsset(tx, sourceID, "channel", channelName, channelName, map[string]string{}, "channels."+channelName)
+		if err != nil {
+			return true, err
+		}
+		if err := insertRelationship(tx, apiID, channelID, "contains_channel", "declared", sourceID, "channels."+channelName); err != nil {
+			return true, err
+		}
+		channel := asMap(asMap(document["channels"])[channelName])
+		for _, operationName := range []string{"publish", "subscribe"} {
+			message := asMap(asMap(channel[operationName])["message"])
+			if message == nil {
+				continue
+			}
+			messageName, _ := message["name"].(string)
+			if messageName == "" {
+				messageName = channelName + " " + operationName
+			}
+			locator := "channels." + channelName + "." + operationName + ".message"
+			messageID, err := insertAsset(tx, sourceID, "message", messageName, channelName+" "+operationName, map[string]string{"operation": operationName}, locator)
+			if err != nil {
+				return true, err
+			}
+			if err := insertRelationship(tx, channelID, messageID, "contains_message", "declared", sourceID, locator); err != nil {
+				return true, err
+			}
+			refs := make(map[string]struct{})
+			collectSchemaRefs(message, refs)
+			for _, name := range sortedSet(refs) {
+				if schemaID, found := schemaIDs[name]; found {
+					if err := insertRelationship(tx, messageID, schemaID, "references_schema", "declared", sourceID, locator); err != nil {
+						return true, err
+					}
+				}
+			}
+		}
+	}
+	return true, nil
 }
 
 func supportedFiles(root string) ([]string, error) {
@@ -472,6 +550,9 @@ func Build(db *sql.DB) (int, error) {
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, err
+	}
+	if err := RecordBuild(db); err != nil {
+		return 0, fmt.Errorf("record build: %w", err)
 	}
 	return count, nil
 }

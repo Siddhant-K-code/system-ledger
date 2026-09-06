@@ -1,0 +1,15 @@
+asyncapi: 2.6.0
+info:
+  title: Billing events
+  version: 1.0.0
+channels:
+  billing.paid:
+    publish:
+      message:
+        name: BillingPaid
+        payload:
+          $ref: "#/components/schemas/Invoice"
+components:
+  schemas:
+    Invoice:
+      type: object

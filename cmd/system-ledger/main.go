@@ -2,6 +2,7 @@ package main
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -11,8 +12,11 @@ import (
 	"strings"
 
 	"github.com/Siddhant-K-code/system-ledger/internal/ledger"
+	"github.com/Siddhant-K-code/system-ledger/internal/present"
 	_ "modernc.org/sqlite"
 )
+
+var version = "dev"
 
 const usage = `system-ledger maps source evidence into a local architecture ledger.
 
@@ -27,11 +31,14 @@ Commands:
   summary             Show services, asset counts, relationships, and warnings.
   explain <name>      Explain an asset and its directly linked assets.
   impact <query>      Show a direct dependency graph for an asset.
+  path <from> <to>    Find a shortest direct dependency path.
   verify              Validate ledger integrity, configuration, and provenance.
+  doctor              Diagnose project, ledger, and evidence health.
 
 All commands accept --project <directory> (default: current directory).
 --db <path> remains available for an explicit ledger location. Report commands
-also accept --format text|json. Run "system-ledger <command> --help" for details.
+also accept --format text|json and --color auto|always|never. Run
+"system-ledger <command> --help" for details.
 `
 
 func main() {
@@ -46,12 +53,17 @@ func run(args []string, out, errOut io.Writer) error {
 		fmt.Fprint(out, usage)
 		return nil
 	}
+	if args[0] == "--version" || args[0] == "version" {
+		fmt.Fprintln(out, version)
+		return nil
+	}
 	command := args[0]
 	fs := flag.NewFlagSet(command, flag.ContinueOnError)
 	fs.SetOutput(errOut)
 	projectPath := fs.String("project", ".", "Project root directory")
 	dbPath := fs.String("db", "", "Explicit SQLite ledger path (overrides --project)")
 	format := fs.String("format", "text", "Output format: text or json (report commands only)")
+	color := fs.String("color", "auto", "Color mode: auto, always, or never")
 	fs.Usage = func() {
 		fmt.Fprintf(errOut, "Usage: system-ledger %s [--project dir] [--db path] %s\n", command, commandArguments(command))
 		fs.PrintDefaults()
@@ -65,6 +77,10 @@ func run(args []string, out, errOut io.Writer) error {
 	if *format != "text" && *format != "json" {
 		return fmt.Errorf("unsupported format %q; use text or json", *format)
 	}
+	if *color != "auto" && *color != "always" && *color != "never" {
+		return fmt.Errorf("unsupported color mode %q; use auto, always, or never", *color)
+	}
+	renderer := present.New(*color, out)
 	root, err := filepath.Abs(*projectPath)
 	if err != nil {
 		return fmt.Errorf("resolve project directory: %w", err)
@@ -89,9 +105,17 @@ func run(args []string, out, errOut io.Writer) error {
 			return err
 		}
 		if result.ConfigCreated {
-			fmt.Fprintf(out, "Initialized %s and %s.\n", result.ConfigPath, result.LedgerPath)
+			if *format == "json" {
+				return jsonOutput(out, result)
+			}
+			fmt.Fprintf(out, "%s\nManifest: %s\nLedger:   %s\nNext: system-ledger scan --project %s && system-ledger build --project %s\n",
+				renderer.Success("Project initialized."), result.ConfigPath, result.LedgerPath, result.ProjectRoot, result.ProjectRoot)
 		} else {
-			fmt.Fprintf(out, "Project already initialized; preserved %s and %s.\n", result.ConfigPath, result.LedgerPath)
+			if *format == "json" {
+				return jsonOutput(out, result)
+			}
+			fmt.Fprintf(out, "%s\nManifest: %s\nNext: system-ledger scan --project %s\n",
+				renderer.Warning("Project already initialized; existing manifest preserved."), result.ConfigPath, result.ProjectRoot)
 		}
 		return nil
 	}
@@ -119,6 +143,10 @@ func run(args []string, out, errOut io.Writer) error {
 			if err != nil {
 				return err
 			}
+			if *format == "json" {
+				return jsonOutput(out, result)
+			}
+			fmt.Fprintln(out, renderer.Heading("Scan complete"))
 			ledger.WriteScanText(out, result)
 		case "ingest":
 			if fs.NArg() != 1 {
@@ -136,7 +164,8 @@ func run(args []string, out, errOut io.Writer) error {
 			if err != nil {
 				return err
 			}
-			fmt.Fprintf(out, "Ingested %d sources: %d APIs, %d operations, %d schemas, %d tables.\n",
+			fmt.Fprintf(out, "%s\nIngested %d sources: %d APIs, %d operations, %d schemas, %d tables.\n",
+				renderer.Heading("Ingestion complete"),
 				stats.Sources, stats.APIs, stats.Operations, stats.Schemas, stats.Tables)
 		case "build":
 			if fs.NArg() != 0 {
@@ -147,7 +176,7 @@ func run(args []string, out, errOut io.Writer) error {
 			if err != nil {
 				return err
 			}
-			fmt.Fprintf(out, "Built %d inferred relationships.\n", count)
+			fmt.Fprintf(out, "%s\nBuilt %d inferred relationships.\n", renderer.Heading("Build complete"), count)
 		case "summary":
 			if fs.NArg() != 0 {
 				fs.Usage()
@@ -166,12 +195,24 @@ func run(args []string, out, errOut io.Writer) error {
 				return errors.New("impact requires exactly one asset query")
 			}
 			return ledger.RenderImpact(db, out, fs.Arg(0), *format)
+		case "path":
+			if fs.NArg() != 2 {
+				fs.Usage()
+				return errors.New("path requires a source and destination asset")
+			}
+			return ledger.RenderPath(db, out, fs.Arg(0), fs.Arg(1), *format)
 		case "verify":
 			if fs.NArg() != 0 {
 				fs.Usage()
 				return errors.New("verify accepts no arguments")
 			}
 			return ledger.RenderVerify(db, out, *format)
+		case "doctor":
+			if fs.NArg() != 0 {
+				fs.Usage()
+				return errors.New("doctor accepts no arguments")
+			}
+			return ledger.RenderDoctor(db, out, root, *format)
 		default:
 			fmt.Fprint(errOut, usage)
 			return fmt.Errorf("unknown command %q", command)
@@ -202,11 +243,19 @@ func commandArguments(command string) string {
 		return "<name>"
 	case "impact":
 		return "<query>"
-	case "scan", "build", "summary", "verify":
+	case "path":
+		return "<from> <to>"
+	case "scan", "build", "summary", "verify", "doctor":
 		return ""
 	default:
 		return "[arguments]"
 	}
+}
+
+func jsonOutput(out io.Writer, value any) error {
+	encoder := json.NewEncoder(out)
+	encoder.SetEscapeHTML(false)
+	return encoder.Encode(value)
 }
 
 func ensureDatabaseParent(path string) error {
