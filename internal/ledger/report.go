@@ -33,13 +33,16 @@ type LinkReport struct {
 }
 
 type AssetReport struct {
+	ID            int64           `json:"id"`
 	Kind          string          `json:"kind"`
 	Name          string          `json:"name"`
 	CanonicalName string          `json:"canonical_name"`
 	Attributes    json.RawMessage `json:"attributes"`
 	Owners        []string        `json:"owners"`
+	Teams         []string        `json:"teams"`
 	Evidence      []EvidenceRef   `json:"evidence"`
 	Links         []LinkReport    `json:"links"`
+	Gaps          []Diagnostic    `json:"extraction_gaps"`
 }
 
 type SummaryReport struct {
@@ -50,6 +53,7 @@ type SummaryReport struct {
 	LastScanAt    string                `json:"last_scan_at,omitempty"`
 	LastBuildAt   string                `json:"last_build_at,omitempty"`
 	Warnings      []string              `json:"warnings"`
+	Gaps          []Diagnostic          `json:"extraction_gaps"`
 }
 
 type ServiceSummary struct {
@@ -66,6 +70,10 @@ type AssetCounts struct {
 	Schemas    int `json:"schemas"`
 	Tables     int `json:"tables"`
 	Services   int `json:"services"`
+	Functions  int `json:"functions"`
+	Routes     int `json:"routes"`
+	Queries    int `json:"queries"`
+	Packages   int `json:"packages"`
 }
 
 type RelationshipSummary struct {
@@ -120,13 +128,21 @@ func assetReport(db *sql.DB, query string) (AssetReport, error) {
 	if err != nil {
 		return AssetReport{}, err
 	}
+	teams, err := teamsFor(db, asset.ID)
+	if err != nil {
+		return AssetReport{}, err
+	}
 	links, err := linksFor(db, asset.ID)
 	if err != nil {
 		return AssetReport{}, err
 	}
+	gaps, err := gapsForEvidence(db, evidence)
+	if err != nil {
+		return AssetReport{}, err
+	}
 	return AssetReport{
-		Kind: asset.Kind, Name: asset.Name, CanonicalName: asset.CanonicalName,
-		Attributes: attributes, Owners: owners, Evidence: evidence, Links: links,
+		ID: asset.ID, Kind: asset.Kind, Name: asset.Name, CanonicalName: asset.CanonicalName,
+		Attributes: attributes, Owners: owners, Teams: teams, Evidence: evidence, Links: links, Gaps: gaps,
 	}, nil
 }
 
@@ -213,6 +229,7 @@ func ownersFor(db *sql.DB, assetID int64) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	defer rows.Close()
 	var owners []string
 	for rows.Next() {
@@ -225,6 +242,25 @@ func ownersFor(db *sql.DB, assetID int64) ([]string, error) {
 	return owners, rows.Err()
 }
 
+func teamsFor(db *sql.DB, assetID int64) ([]string, error) {
+	rows, err := db.Query(`SELECT DISTINCT c.owner FROM service_configs c JOIN assets s ON s.name = c.name AND s.kind = 'service'
+		WHERE s.id = ? OR s.id IN (SELECT from_asset_id FROM relationships WHERE to_asset_id = ? AND relationship_type = 'owns_asset')
+		ORDER BY c.owner`, assetID, assetID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	teams := []string{}
+	for rows.Next() {
+		var team string
+		if err := rows.Scan(&team); err != nil {
+			return nil, err
+		}
+		teams = append(teams, team)
+	}
+	return teams, rows.Err()
+}
+
 func WriteSummary(db *sql.DB, out io.Writer, format string) error {
 	report, err := Summary(db)
 	if err != nil {
@@ -235,6 +271,8 @@ func WriteSummary(db *sql.DB, out io.Writer, format string) error {
 	}
 	fmt.Fprintf(out, "Sources: %d | Services: %d | APIs: %d | Operations: %d | Schemas: %d | Tables: %d\n",
 		report.Sources, report.Assets.Services, report.Assets.APIs, report.Assets.Operations, report.Assets.Schemas, report.Assets.Tables)
+	fmt.Fprintf(out, "Go packages: %d | Functions: %d | Routes: %d | Queries: %d\n",
+		report.Assets.Packages, report.Assets.Functions, report.Assets.Routes, report.Assets.Queries)
 	if report.LastScanAt != "" {
 		fmt.Fprintf(out, "Last scan: %s", report.LastScanAt)
 		if report.LastBuildAt != "" {
@@ -264,6 +302,7 @@ func WriteSummary(db *sql.DB, out io.Writer, format string) error {
 			fmt.Fprintf(out, "- %s\n", warning)
 		}
 	}
+	writeDiagnostics(out, report.Gaps)
 	return nil
 }
 
@@ -300,6 +339,14 @@ func Summary(db *sql.DB) (SummaryReport, error) {
 			report.Assets.Tables = count
 		case "service":
 			report.Assets.Services = count
+		case "function":
+			report.Assets.Functions = count
+		case "route":
+			report.Assets.Routes = count
+		case "query":
+			report.Assets.Queries = count
+		case "package":
+			report.Assets.Packages = count
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -351,6 +398,10 @@ func Summary(db *sql.DB) (SummaryReport, error) {
 	if report.Warnings == nil {
 		report.Warnings = make([]string, 0)
 	}
+	report.Gaps, err = Diagnostics(db)
+	if err != nil {
+		return SummaryReport{}, err
+	}
 	return report, nil
 }
 
@@ -373,7 +424,7 @@ func RenderVerify(db *sql.DB, out io.Writer, format string) error {
 	return nil
 }
 
-func Verify(db *sql.DB) error {
+func Verify(db queryer) error {
 	report := Verification(db)
 	if !report.Valid {
 		return fmt.Errorf("ledger verification failed: %s", strings.Join(report.Issues, "; "))
@@ -381,7 +432,7 @@ func Verify(db *sql.DB) error {
 	return nil
 }
 
-func Verification(db *sql.DB) VerificationReport {
+func Verification(db queryer) VerificationReport {
 	issues := validationIssues(db)
 	if issues == nil {
 		issues = make([]string, 0)
@@ -389,7 +440,7 @@ func Verification(db *sql.DB) VerificationReport {
 	return VerificationReport{Valid: len(issues) == 0, Issues: issues}
 }
 
-func validationIssues(db *sql.DB) []string {
+func validationIssues(db queryer) []string {
 	var issues []string
 	checks := []struct {
 		name, query string
@@ -417,6 +468,10 @@ func validationIssues(db *sql.DB) []string {
 		issues = append(issues, "project root is not recorded; rerun scan or ingest")
 		return sortedUnique(issues)
 	}
+	if err := validateSourcePath(root, root); err != nil {
+		issues = append(issues, "recorded project root is missing or is a symlink; restore it and rerun scan")
+		return sortedUnique(issues)
+	}
 	serviceRows, err := db.Query(`SELECT name, source_root FROM service_configs ORDER BY name`)
 	if err != nil {
 		issues = append(issues, fmt.Sprintf("could not read configured service roots: %v", err))
@@ -429,7 +484,7 @@ func validationIssues(db *sql.DB) []string {
 			}
 			path := filepath.Join(root, filepath.FromSlash(sourceRoot))
 			info, err := os.Stat(path)
-			if err != nil || !info.IsDir() || !isWithin(root, path) {
+			if err != nil || !info.IsDir() || validateSourcePath(root, path) != nil {
 				issues = append(issues, fmt.Sprintf("service %q source root %q is missing or invalid; update %s and rerun scan",
 					name, sourceRoot, ConfigFilename))
 			}
@@ -451,7 +506,7 @@ func validationIssues(db *sql.DB) []string {
 				issues = append(issues, fmt.Sprintf("evidence source %q escapes the project root; rerun scan", path))
 				continue
 			}
-			content, err := os.ReadFile(fullPath)
+			content, err := readSource(root, fullPath)
 			if err != nil {
 				issues = append(issues, fmt.Sprintf("evidence source %q is unavailable; rerun scan after restoring it", path))
 				continue
@@ -462,10 +517,11 @@ func validationIssues(db *sql.DB) []string {
 		}
 		sourceRows.Close()
 	}
+	issues = append(issues, inventoryIssues(db, root)...)
 	return sortedUnique(issues)
 }
 
-func projectRoot(db *sql.DB) string {
+func projectRoot(db queryer) string {
 	var root string
 	if err := db.QueryRow(`SELECT value FROM project_metadata WHERE key = 'project_root'`).Scan(&root); err != nil {
 		return ""

@@ -1,4 +1,4 @@
-// Package ledger owns the local SQLite model and deterministic v0 extraction rules.
+// Package ledger owns the local SQLite graph and deterministic extraction rules.
 package ledger
 
 import (
@@ -6,26 +6,30 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 	"unicode"
 
 	"gopkg.in/yaml.v3"
 )
 
-const schemaVersion = 2
+const schemaVersion = 3
 
-var createTablePattern = regexp.MustCompile("(?is)\\bCREATE\\s+(?:TEMP(?:ORARY)?\\s+)?TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?((?:[\"`\\[]?[A-Za-z_][A-Za-z0-9_$]*[\"`\\]]?\\s*\\.\\s*)*(?:[\"`\\[]?[A-Za-z_][A-Za-z0-9_$]*[\"`\\]]?))")
+const sqlIdentifier = "(?:[A-Za-z_][A-Za-z0-9_$]*|\"[A-Za-z_][A-Za-z0-9_$]*\"|`[A-Za-z_][A-Za-z0-9_$]*`|\\[[A-Za-z_][A-Za-z0-9_$]*\\])"
+
+var createTablePattern = regexp.MustCompile("(?is)^\\s*CREATE\\s+(?:TEMP(?:ORARY)?\\s+)?TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?(" + sqlIdentifier + "(?:\\s*\\.\\s*" + sqlIdentifier + ")*)\\s*\\(")
 
 type Stats struct {
 	Sources, APIs, Operations, Schemas, Tables int
 	Services, CandidateFiles, SkippedFiles     int
+	Functions, Routes, Queries, Gaps, Packages int
 }
 
 type Asset struct {
@@ -41,6 +45,11 @@ type Relation struct {
 	Type, Origin       string
 	FromKind, FromName string
 	ToKind, ToName     string
+}
+
+type queryer interface {
+	Query(string, ...any) (*sql.Rows, error)
+	QueryRow(string, ...any) *sql.Row
 }
 
 // Migrate creates the built-in, versioned schema. It is safe to call before every command.
@@ -61,8 +70,14 @@ func Migrate(db *sql.DB) error {
 	if version == schemaVersion {
 		return nil
 	}
+	if version == 2 {
+		return applySourceSchema(db)
+	}
 	if version == 1 {
-		return applyProjectSchema(db)
+		if err := applyProjectSchema(db); err != nil {
+			return err
+		}
+		return applySourceSchema(db)
 	}
 	tx, err := db.Begin()
 	if err != nil {
@@ -108,7 +123,10 @@ func Migrate(db *sql.DB) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	return applyProjectSchema(db)
+	if err := applyProjectSchema(db); err != nil {
+		return err
+	}
+	return applySourceSchema(db)
 }
 
 func applyProjectSchema(db *sql.DB) error {
@@ -165,11 +183,15 @@ func applyProjectSchema(db *sql.DB) error {
 // Ingest replaces prior extracted material with facts from one directory. This makes
 // reruns deterministic and idempotent while retaining the ledger's migration history.
 func Ingest(db *sql.DB, root string) (Stats, error) {
+	return ingest(db, root, nil, nil)
+}
+
+func ingest(db *sql.DB, root string, config *Config, manifest []byte) (Stats, error) {
 	root, err := filepath.Abs(root)
 	if err != nil {
 		return Stats{}, fmt.Errorf("resolve input directory: %w", err)
 	}
-	info, err := os.Stat(root)
+	info, err := os.Lstat(root)
 	if err != nil {
 		return Stats{}, fmt.Errorf("read input directory: %w", err)
 	}
@@ -180,15 +202,12 @@ func Ingest(db *sql.DB, root string) (Stats, error) {
 	if err != nil {
 		return Stats{}, err
 	}
-	if len(files) == 0 {
-		return Stats{}, errors.New("no supported OpenAPI (.json/.yaml/.yml) or SQL (.sql) files found")
-	}
 	tx, err := db.Begin()
 	if err != nil {
 		return Stats{}, err
 	}
 	defer tx.Rollback()
-	for _, table := range []string{"evidence", "relationships", "assets", "sources"} {
+	for _, table := range []string{"diagnostics", "scanned_files", "evidence", "relationships", "assets", "sources", "service_configs"} {
 		if _, err := tx.Exec("DELETE FROM " + table); err != nil {
 			return Stats{}, fmt.Errorf("clear previous %s: %w", table, err)
 		}
@@ -198,9 +217,12 @@ func Ingest(db *sql.DB, root string) (Stats, error) {
 		return Stats{}, fmt.Errorf("record project root: %w", err)
 	}
 	var stats Stats
+	var goFiles []sourceInput
+	goBytes := 0
+	sourceIDs := make(map[string]int64)
 	stats.CandidateFiles = len(files)
 	for _, path := range files {
-		bytes, err := os.ReadFile(path)
+		bytes, err := readSource(root, path)
 		if err != nil {
 			return Stats{}, fmt.Errorf("read %q: %w", path, err)
 		}
@@ -208,12 +230,32 @@ func Ingest(db *sql.DB, root string) (Stats, error) {
 		if err != nil {
 			return Stats{}, fmt.Errorf("make source path relative to project: %w", err)
 		}
-		sourceID, err := insertSource(tx, filepath.ToSlash(relativePath), bytes)
+		relativePath = filepath.ToSlash(relativePath)
+		if config != nil && relativePath == ConfigFilename && sourceHash(bytes) != sourceHash(manifest) {
+			return Stats{}, fmt.Errorf("manifest changed during scan; rerun scan")
+		}
+		if _, err := tx.Exec(`INSERT INTO scanned_files(path, sha256) VALUES (?, ?)`, relativePath, sourceHash(bytes)); err != nil {
+			return Stats{}, err
+		}
+		if filepath.Ext(path) == ".go" && generatedGo(bytes) {
+			if err := insertDiagnostic(tx, Diagnostic{Code: "generated_file", Message: "Generated Go source excluded.", Path: relativePath, Locator: "file"}); err != nil {
+				return Stats{}, err
+			}
+			continue
+		}
+		sourceID, err := insertSource(tx, relativePath, bytes)
 		if err != nil {
 			return Stats{}, err
 		}
 		stats.Sources++
+		sourceIDs[relativePath] = sourceID
 		switch strings.ToLower(filepath.Ext(path)) {
+		case ".go":
+			goBytes += len(bytes)
+			if goBytes > 64<<20 {
+				return Stats{}, fmt.Errorf("Go source inventory exceeds 64 MiB; select a narrower project root")
+			}
+			goFiles = append(goFiles, sourceInput{Path: relativePath, Content: bytes})
 		case ".sql":
 			if err := ingestSQL(tx, sourceID, string(bytes), &stats); err != nil {
 				return Stats{}, fmt.Errorf("ingest SQL %q: %w", path, err)
@@ -239,8 +281,24 @@ func Ingest(db *sql.DB, root string) (Stats, error) {
 			}
 		}
 	}
-	if stats.Sources == 0 {
-		return Stats{}, errors.New("no OpenAPI documents or SQL DDL files were recognized")
+	if err := ingestGo(tx, goFiles, sourceIDs, config, &stats); err != nil {
+		return Stats{}, err
+	}
+	if config != nil {
+		if err := attachServices(tx, *config, manifest); err != nil {
+			return Stats{}, err
+		}
+		stats.Services = len(config.Services)
+	}
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM diagnostics`).Scan(&stats.Gaps); err != nil {
+		return Stats{}, err
+	}
+	if _, err := tx.Exec(`DELETE FROM project_metadata WHERE key = 'last_build_at'`); err != nil {
+		return Stats{}, err
+	}
+	if _, err := tx.Exec(`INSERT INTO project_metadata(key, value) VALUES ('last_scan_at', ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value`, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		return Stats{}, err
 	}
 	if err := tx.Commit(); err != nil {
 		return Stats{}, fmt.Errorf("commit ingestion: %w", err)
@@ -331,10 +389,20 @@ func supportedFiles(root string) ([]string, error) {
 			}
 			return nil
 		}
+		if !d.Type().IsRegular() || credentialFilename(d.Name()) {
+			return nil
+		}
 
 		switch strings.ToLower(filepath.Ext(path)) {
 		case ".json", ".yaml", ".yml", ".sql":
 			files = append(files, path)
+		case ".go":
+			if !strings.HasSuffix(d.Name(), "_test.go") {
+				files = append(files, path)
+			}
+		}
+		if len(files) > 10000 {
+			return fmt.Errorf("project exceeds 10000 candidate files; select a narrower project root")
 		}
 		return nil
 	})
@@ -343,8 +411,11 @@ func supportedFiles(root string) ([]string, error) {
 }
 
 func ignoredDirectory(name string) bool {
+	if strings.HasPrefix(name, ".") {
+		return true
+	}
 	switch name {
-	case ".git", ".system-ledger", "node_modules", "vendor":
+	case "node_modules", "vendor":
 		return true
 	default:
 		return false
@@ -433,7 +504,11 @@ func ingestOpenAPI(tx *sql.Tx, sourceID int64, content []byte, stats *Stats) (bo
 }
 
 func ingestSQL(tx *sql.Tx, sourceID int64, text string, stats *Stats) error {
-	for _, match := range createTablePattern.FindAllStringSubmatch(stripSQLComments(text), -1) {
+	for _, statement := range ddlStatements(text) {
+		match := createTablePattern.FindStringSubmatch(statement)
+		if match == nil {
+			continue
+		}
 		rawName := match[1]
 		name := tableLeafName(rawName)
 		if name == "" {
@@ -468,19 +543,19 @@ func insertAsset(tx *sql.Tx, sourceID int64, kind, name, canonical string, attri
 }
 
 func insertRelationship(tx *sql.Tx, fromID, toID int64, relationType, origin string, sourceID int64, locator string) error {
-	result, err := tx.Exec(`INSERT OR IGNORE INTO relationships(from_asset_id, to_asset_id, relationship_type, origin) VALUES (?, ?, ?, ?)`,
+	_, err := tx.Exec(`INSERT OR IGNORE INTO relationships(from_asset_id, to_asset_id, relationship_type, origin) VALUES (?, ?, ?, ?)`,
 		fromID, toID, relationType, origin)
 	if err != nil {
 		return err
 	}
-	id, err := result.LastInsertId()
-	if err != nil {
+	var id int64
+	if err := tx.QueryRow(`SELECT id FROM relationships WHERE from_asset_id = ? AND to_asset_id = ? AND relationship_type = ? AND origin = ?`,
+		fromID, toID, relationType, origin).Scan(&id); err != nil {
 		return err
 	}
-	if id == 0 {
-		return nil
-	}
-	_, err = tx.Exec(`INSERT INTO evidence(source_id, relationship_id, locator) VALUES (?, ?, ?)`, sourceID, id, locator)
+	_, err = tx.Exec(`INSERT INTO evidence(source_id, relationship_id, locator)
+		SELECT ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM evidence WHERE source_id = ? AND relationship_id = ? AND locator = ?)`,
+		sourceID, id, locator, sourceID, id, locator)
 	return err
 }
 
@@ -492,6 +567,9 @@ func Build(db *sql.DB) (int, error) {
 		return 0, err
 	}
 	defer tx.Rollback()
+	if err := Verify(tx); err != nil {
+		return 0, err
+	}
 	if _, err := tx.Exec(`DELETE FROM relationships WHERE origin = 'inferred'`); err != nil {
 		return 0, err
 	}
@@ -548,11 +626,12 @@ func Build(db *sql.DB) (int, error) {
 		}
 		count++
 	}
+	if _, err := tx.Exec(`INSERT INTO project_metadata(key, value) VALUES ('last_build_at', ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value`, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		return 0, fmt.Errorf("record build: %w", err)
+	}
 	if err := tx.Commit(); err != nil {
 		return 0, err
-	}
-	if err := RecordBuild(db); err != nil {
-		return 0, fmt.Errorf("record build: %w", err)
 	}
 	return count, nil
 }
@@ -580,7 +659,10 @@ func Explain(db *sql.DB, out io.Writer, name string) error {
 		return err
 	}
 	fmt.Fprintln(out, "Direct links:")
-	return writeRelations(db, out, asset.ID)
+	if err := writeRelations(db, out, asset.ID); err != nil {
+		return err
+	}
+	return writeAssetDiagnostics(db, out, asset.ID)
 }
 
 func Impact(db *sql.DB, out io.Writer, query string) error {
@@ -596,12 +678,35 @@ func Impact(db *sql.DB, out io.Writer, query string) error {
 	if len(owners) > 0 {
 		fmt.Fprintf(out, "Owners: %s\n", strings.Join(owners, ", "))
 	}
-	return writeRelations(db, out, asset.ID)
+	if err := writeRelations(db, out, asset.ID); err != nil {
+		return err
+	}
+	return writeAssetDiagnostics(db, out, asset.ID)
 }
 
-func findAsset(db *sql.DB, query string) (Asset, error) {
+func findAsset(db queryer, query string) (Asset, error) {
+	if strings.HasPrefix(query, "id:") {
+		id, err := strconv.ParseInt(strings.TrimPrefix(query, "id:"), 10, 64)
+		if err != nil {
+			return Asset{}, fmt.Errorf("asset ID must use id:<integer>")
+		}
+		var asset Asset
+		err = db.QueryRow(`SELECT id, kind, name, canonical_name, attributes FROM assets WHERE id = ?`, id).
+			Scan(&asset.ID, &asset.Kind, &asset.Name, &asset.CanonicalName, &asset.Attributes)
+		if err != nil {
+			return Asset{}, fmt.Errorf("asset ID %q is unavailable: %w", query, err)
+		}
+		return asset, nil
+	}
+	kind, name := "", query
+	if prefix, rest, found := strings.Cut(query, ":"); found {
+		switch prefix {
+		case "api", "operation", "schema", "table", "service", "function", "route", "query", "package", "channel", "message":
+			kind, name = prefix, rest
+		}
+	}
 	rows, err := db.Query(`SELECT id, kind, name, canonical_name, attributes
-		FROM assets WHERE name = ? OR canonical_name = ? ORDER BY kind, name, id`, query, query)
+		FROM assets WHERE (name = ? OR canonical_name = ?) AND (? = '' OR kind = ?) ORDER BY kind, name, id`, name, name, kind, kind)
 	if err != nil {
 		return Asset{}, err
 	}
@@ -625,7 +730,7 @@ func findAsset(db *sql.DB, query string) (Asset, error) {
 	default:
 		names := make([]string, len(candidates))
 		for i, candidate := range candidates {
-			names[i] = candidate.Kind + ":" + candidate.Name
+			names[i] = fmt.Sprintf("id:%d %s:%s (%s)", candidate.ID, candidate.Kind, candidate.Name, candidate.CanonicalName)
 		}
 		return Asset{}, fmt.Errorf("asset %q is ambiguous; candidates: %s", query, strings.Join(names, ", "))
 	}
@@ -768,9 +873,4 @@ func normalizeSQLName(value string) string {
 func tableLeafName(value string) string {
 	parts := strings.Split(normalizeSQLName(value), ".")
 	return parts[len(parts)-1]
-}
-
-func stripSQLComments(value string) string {
-	value = regexp.MustCompile(`(?s)/\*.*?\*/`).ReplaceAllString(value, " ")
-	return regexp.MustCompile(`(?m)--[^\n]*`).ReplaceAllString(value, "")
 }

@@ -14,6 +14,7 @@ import (
 type PathStep struct {
 	Asset            AssetRef      `json:"asset"`
 	Owners           []string      `json:"owners"`
+	Teams            []string      `json:"teams"`
 	Direction        string        `json:"direction"`
 	RelationshipType string        `json:"relationship_type"`
 	Origin           string        `json:"origin"`
@@ -40,7 +41,7 @@ type DoctorCheck struct {
 
 func RecordBuild(db *sql.DB) error {
 	_, err := db.Exec(`INSERT INTO project_metadata(key, value) VALUES ('last_build_at', ?)
-		ON CONFLICT(key) DO UPDATE SET value = excluded.value`, time.Now().UTC().Format(time.RFC3339))
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value`, time.Now().UTC().Format(time.RFC3339Nano))
 	return err
 }
 
@@ -121,12 +122,16 @@ func FindPath(db *sql.DB, fromQuery, toQuery string) (PathReport, error) {
 		if err != nil {
 			return PathReport{}, err
 		}
+		teams, err := teamsFor(db, trail.edge.next)
+		if err != nil {
+			return PathReport{}, err
+		}
 		evidence, err := evidenceFor(db, "relationship_id", trail.edge.id)
 		if err != nil {
 			return PathReport{}, err
 		}
 		reversed = append(reversed, PathStep{
-			Asset: AssetRef{Kind: trail.edge.nextKind, Name: trail.edge.nextName}, Owners: owners,
+			Asset: AssetRef{Kind: trail.edge.nextKind, Name: trail.edge.nextName}, Owners: owners, Teams: teams,
 			Direction: trail.edge.direction, RelationshipType: trail.edge.relationshipType,
 			Origin: trail.edge.origin, Evidence: evidence,
 		})
@@ -157,12 +162,18 @@ func Doctor(db *sql.DB, root string) DoctorReport {
 	}
 	if projectRoot(db) == "" {
 		checks = append(checks, DoctorCheck{"warning", "scan", "No completed scan is recorded.", "Run: system-ledger scan"})
-	} else if metadata(db, "last_build_at") == "" || metadata(db, "last_build_at") < metadata(db, "last_scan_at") {
+	} else if metadata(db, "last_build_at") == "" {
 		checks = append(checks, DoctorCheck{"warning", "build", "Inferred links are missing or older than the last scan.", "Run: system-ledger build"})
 	} else {
 		checks = append(checks, DoctorCheck{"ok", "build", "Ledger is built from the latest scan.", ""})
 	}
 	healthy := true
+	gaps, err := Diagnostics(db)
+	if err != nil {
+		checks = append(checks, DoctorCheck{"failure", "coverage", "Cannot read extraction diagnostics.", "Rerun scan."})
+	} else if len(gaps) > 0 {
+		checks = append(checks, DoctorCheck{"warning", "coverage", fmt.Sprintf("%d extraction gaps; static inventory is not a deployed build or exhaustive impact map.", len(gaps)), "Inspect: system-ledger summary"})
+	}
 	for _, check := range checks {
 		if check.Status == "failure" {
 			healthy = false
@@ -171,7 +182,7 @@ func Doctor(db *sql.DB, root string) DoctorReport {
 	return DoctorReport{Healthy: healthy, Checks: checks}
 }
 
-func metadata(db *sql.DB, key string) string {
+func metadata(db queryer, key string) string {
 	var value string
 	_ = db.QueryRow(`SELECT value FROM project_metadata WHERE key = ?`, key).Scan(&value)
 	return value
@@ -193,6 +204,9 @@ func RenderPath(db *sql.DB, out io.Writer, from, to, format string) error {
 		fmt.Fprintf(out, "%d. %s %s [%s] %s %q", index+1, step.Direction, step.RelationshipType, step.Origin, step.Asset.Kind, step.Asset.Name)
 		if len(step.Owners) > 0 {
 			fmt.Fprintf(out, " (owner: %s)", strings.Join(step.Owners, ", "))
+		}
+		if len(step.Teams) > 0 {
+			fmt.Fprintf(out, " (team: %s)", strings.Join(step.Teams, ", "))
 		}
 		fmt.Fprintln(out)
 		for _, evidence := range step.Evidence {

@@ -1,0 +1,7 @@
+version: 1
+services:
+  - name: reports-service
+    owner: reporting-platform
+    source: services/reports
+    domain: reporting
+    tags: [api, go, reports]

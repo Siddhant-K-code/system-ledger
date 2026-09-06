@@ -138,7 +138,7 @@ func TestMigrateV1LedgerToProjectSchema(t *testing.T) {
 		t.Fatalf("v2 service table unavailable: %v", err)
 	}
 	var version int
-	if err := db.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 2 {
-		t.Fatalf("schema version = %d, %v; want 2, nil", version, err)
+	if err := db.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != schemaVersion {
+		t.Fatalf("schema version = %d, %v; want %d, nil", version, err, schemaVersion)
 	}
 }

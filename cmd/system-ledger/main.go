@@ -34,6 +34,7 @@ Commands:
   path <from> <to>    Find a shortest direct dependency path.
   verify              Validate ledger integrity, configuration, and provenance.
   doctor              Diagnose project, ledger, and evidence health.
+  ask                 Preview or explicitly authorize evidence-assisted suggestions.
 
 All commands accept --project <directory> (default: current directory).
 --db <path> remains available for an explicit ledger location. Report commands
@@ -64,6 +65,14 @@ func run(args []string, out, errOut io.Writer) error {
 	dbPath := fs.String("db", "", "Explicit SQLite ledger path (overrides --project)")
 	format := fs.String("format", "text", "Output format: text or json (report commands only)")
 	color := fs.String("color", "auto", "Color mode: auto, always, or never")
+	var ask askOptions
+	if command == "ask" {
+		fs.StringVar(&ask.Asset, "asset", "", "Required asset name, canonical name, kind:name, or id:<integer>")
+		fs.StringVar(&ask.Provider, "provider", "", "Provider: openai or anthropic (overrides project setting)")
+		fs.StringVar(&ask.Model, "model", "", "Exact compatible provider model ID (overrides project setting)")
+		fs.BoolVar(&ask.DryRun, "dry-run", false, "Preview the exact request body without a key or network call")
+		fs.BoolVar(&ask.AllowRemote, "allow-remote", false, "Explicitly consent to sending the bounded evidence request")
+	}
 	fs.Usage = func() {
 		fmt.Fprintf(errOut, "Usage: system-ledger %s [--project dir] [--db path] %s\n", command, commandArguments(command))
 		fs.PrintDefaults()
@@ -129,11 +138,18 @@ func run(args []string, out, errOut io.Writer) error {
 	if *dbPath == "" {
 		*dbPath = ledger.ProjectDatabasePath(root)
 	}
+	if command == "ask" {
+		if err := ask.resolve(root, fs.Args()); err != nil {
+			return err
+		}
+	}
 	return runWithDatabase(*dbPath, func(db *sql.DB) error {
 		if err := ledger.Migrate(db); err != nil {
 			return err
 		}
 		switch command {
+		case "ask":
+			return runAsk(db, root, ask, fs.Arg(0), out, *format)
 		case "scan":
 			if fs.NArg() != 0 {
 				fs.Usage()
@@ -230,6 +246,7 @@ func runWithDatabase(path string, run func(*sql.DB) error) error {
 		return fmt.Errorf("open ledger: %w", err)
 	}
 	defer db.Close()
+	db.SetMaxOpenConns(1)
 	return run(db)
 }
 
@@ -247,6 +264,8 @@ func commandArguments(command string) string {
 		return "<from> <to>"
 	case "scan", "build", "summary", "verify", "doctor":
 		return ""
+	case "ask":
+		return "--asset <name-or-id> [--provider name] [--model id] (--dry-run | --allow-remote) '<question>'"
 	default:
 		return "[arguments]"
 	}

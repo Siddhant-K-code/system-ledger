@@ -25,8 +25,14 @@ services: []
 `
 
 type Config struct {
-	Version  int       `yaml:"version"`
-	Services []Service `yaml:"services"`
+	Version    int              `yaml:"version"`
+	Services   []Service        `yaml:"services"`
+	Assistance AssistanceConfig `yaml:"assistance,omitempty"`
+}
+
+type AssistanceConfig struct {
+	Provider string `yaml:"provider,omitempty"`
+	Model    string `yaml:"model,omitempty"`
 }
 
 type Service struct {
@@ -46,7 +52,8 @@ type InitResult struct {
 }
 
 type ScanResult struct {
-	Stats Stats
+	Stats       Stats
+	Diagnostics []Diagnostic `json:"extraction_gaps"`
 }
 
 // Init creates only the project-owned locations that do not already exist.
@@ -83,15 +90,23 @@ func Init(projectRoot string) (InitResult, error) {
 
 func LoadConfig(projectRoot string) (Config, error) {
 	path := filepath.Join(projectRoot, ConfigFilename)
-	content, err := os.ReadFile(path)
+	content, err := readSource(projectRoot, path)
 	if err != nil {
 		return Config{}, fmt.Errorf("read manifest %q: %w", path, err)
 	}
+	return parseConfig(path, content)
+}
+
+func parseConfig(path string, content []byte) (Config, error) {
 	decoder := yaml.NewDecoder(bytes.NewReader(content))
 	decoder.KnownFields(true)
 	var config Config
 	if err := decoder.Decode(&config); err != nil {
 		return Config{}, fmt.Errorf("parse manifest %q: %w", path, err)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return Config{}, fmt.Errorf("manifest %q must contain exactly one YAML document", path)
 	}
 	if config.Version != 1 {
 		return Config{}, fmt.Errorf("manifest %q must declare version: 1", path)
@@ -128,38 +143,29 @@ func Scan(db *sql.DB, projectRoot string) (ScanResult, error) {
 	if err != nil {
 		return ScanResult{}, fmt.Errorf("resolve project directory: %w", err)
 	}
-	config, err := LoadConfig(root)
+	manifest, err := readSource(root, filepath.Join(root, ConfigFilename))
+	if err != nil {
+		return ScanResult{}, fmt.Errorf("read project manifest: %w", err)
+	}
+	config, err := parseConfig(ConfigFilename, manifest)
 	if err != nil {
 		return ScanResult{}, err
 	}
 	if err := validateServiceRoots(root, config.Services); err != nil {
 		return ScanResult{}, err
 	}
-	stats, err := Ingest(db, root)
+	stats, err := ingest(db, root, &config, manifest)
 	if err != nil {
 		return ScanResult{}, err
 	}
-	if err := attachServices(db, root, config); err != nil {
+	gaps, err := Diagnostics(db)
+	if err != nil {
 		return ScanResult{}, err
 	}
-	if err := RecordScan(db); err != nil {
-		return ScanResult{}, fmt.Errorf("record scan: %w", err)
-	}
-	stats.Services = len(config.Services)
-	return ScanResult{Stats: stats}, nil
+	return ScanResult{Stats: stats, Diagnostics: gaps}, nil
 }
 
-func attachServices(db *sql.DB, projectRoot string, config Config) error {
-	manifestPath := filepath.Join(projectRoot, ConfigFilename)
-	content, err := os.ReadFile(manifestPath)
-	if err != nil {
-		return fmt.Errorf("read service manifest: %w", err)
-	}
-	tx, err := db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
+func attachServices(tx *sql.Tx, config Config, content []byte) error {
 	manifestID, err := insertSource(tx, ConfigFilename, content)
 	if err != nil {
 		return err
@@ -188,8 +194,8 @@ func attachServices(db *sql.DB, projectRoot string, config Config) error {
 			return err
 		}
 		assetRows, err := tx.Query(`SELECT a.id FROM assets a JOIN sources s ON s.id = a.source_id
-			WHERE a.kind != 'service' AND (s.path = ? OR s.path LIKE ?)
-			ORDER BY s.path, a.kind, a.name, a.id`, service.Source, service.Source+"/%")
+			WHERE a.kind != 'service' AND (s.path = ? OR substr(s.path, 1, length(?)) = ?)
+			ORDER BY s.path, a.kind, a.name, a.id`, service.Source, service.Source+"/", service.Source+"/")
 		if err != nil {
 			return err
 		}
@@ -216,13 +222,13 @@ func attachServices(db *sql.DB, projectRoot string, config Config) error {
 			}
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
 func validateServiceRoots(projectRoot string, services []Service) error {
 	for _, service := range services {
 		root := filepath.Join(projectRoot, filepath.FromSlash(service.Source))
-		if !isWithin(projectRoot, root) {
+		if err := validateSourcePath(projectRoot, root); err != nil {
 			return fmt.Errorf("service %q source escapes project root", service.Name)
 		}
 		info, err := os.Stat(root)
@@ -271,4 +277,7 @@ func WriteScanText(out io.Writer, result ScanResult) {
 	if stats.SkippedFiles > 0 {
 		fmt.Fprintf(out, "Skipped %d YAML/JSON files that are not OpenAPI documents.\n", stats.SkippedFiles)
 	}
+	fmt.Fprintf(out, "Go source inventory: %d functions, %d routes, %d queries; %d extraction gaps (see summary).\n",
+		stats.Functions, stats.Routes, stats.Queries, stats.Gaps)
+	writeDiagnostics(out, result.Diagnostics)
 }
